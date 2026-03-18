@@ -1,0 +1,47 @@
+﻿groups:
+  - name: domain_ssl_checker_alerts
+    rules:
+      - alert: DomainSSLExpiryCritical
+        expr: domain_ssl_expiry_days <= 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SSL certificate expires very soon"
+          description: "SSL for {{ $labels.domain }} expires in {{ $value }} days"
+
+      - alert: DomainRegistrationExpiryCritical
+        expr: domain_expiry_days <= 7
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Domain registration expires very soon"
+          description: "Domain {{ $labels.domain }} expires in {{ $value }} days"
+
+      - alert: DomainHTTPDown
+        expr: domain_http_status_code >= 500
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Domain HTTP check is failing"
+          description: "HTTP status for {{ $labels.domain }} is {{ $value }}"
+
+      - alert: DomainOCSPRevoked
+        expr: domain_ocsp_status < 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Certificate revoked (OCSP)"
+          description: "OCSP reports revoked cert for {{ $labels.domain }}"
+
+      - alert: DomainCRLRevoked
+        expr: domain_crl_status < 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Certificate revoked (CRL)"
+          description: "CRL reports revoked cert for {{ $labels.domain }}"

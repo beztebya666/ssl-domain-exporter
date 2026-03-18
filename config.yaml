@@ -1,0 +1,64 @@
+﻿server:
+  host: "0.0.0.0"
+  port: "8080"
+
+database:
+  path: "./data/checker.db"
+
+auth:
+  enabled: true
+  mode: "basic"          # basic | api_key | both
+  username: "admin"
+  password: "admin"
+  api_key: ""
+  protect_api: true
+  protect_metrics: false
+  protect_ui: false
+
+checker:
+  interval: "6h"
+  timeout: "30s"
+  concurrent_checks: 5
+  retry_count: 2
+
+features:
+  http_check: false
+  cipher_check: false
+  ocsp_check: false
+  crl_check: false
+  caa_check: false
+  notifications: false
+  csv_export: false
+  timeline_view: false
+  dashboard_tag_filter: false
+  structured_logs: false
+
+alerts:
+  domain_expiry_warning_days: 30
+  domain_expiry_critical_days: 7
+  ssl_expiry_warning_days: 14
+  ssl_expiry_critical_days: 3
+
+notifications:
+  webhook:
+    enabled: false
+    url: ""
+    on_critical: true
+    on_warning: false
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+    on_critical: true
+    on_warning: false
+
+domains:
+  subdomain_fallback: true
+  fallback_depth: 5
+
+prometheus:
+  enabled: true
+  path: "/metrics"
+
+logging:
+  json: false

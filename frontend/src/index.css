@@ -1,0 +1,179 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-950 text-slate-100 font-sans antialiased;
+  }
+
+  .theme-light body {
+    @apply bg-gray-50 text-gray-900;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-slate-900 border border-slate-700/60 rounded-xl p-5;
+  }
+  .btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-blue-600 hover:bg-blue-500 text-white;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent hover:bg-slate-700 text-slate-300;
+  }
+  .btn-danger {
+    @apply btn bg-red-600/20 hover:bg-red-600/40 text-red-400;
+  }
+  .input {
+    @apply bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 w-full;
+  }
+  .label {
+    @apply block text-xs font-medium text-slate-400 mb-1.5;
+  }
+
+  .theme-light .card {
+    background-color: rgb(255 255 255);
+    border-color: rgb(229 231 235);
+    box-shadow: 0 1px 2px rgb(17 24 39 / 0.05);
+  }
+
+  .theme-light .btn-ghost {
+    color: rgb(55 65 81);
+  }
+
+  .theme-light .btn-ghost:hover {
+    background-color: rgb(243 244 246);
+  }
+
+  .theme-light .input {
+    background-color: rgb(255 255 255);
+    border-color: rgb(209 213 219);
+    color: rgb(17 24 39);
+  }
+
+  .theme-light .input::placeholder {
+    color: rgb(156 163 175);
+  }
+
+  .theme-light .label {
+    color: rgb(75 85 99);
+  }
+}
+
+@layer utilities {
+  .theme-light .bg-slate-900 {
+    background-color: rgb(255 255 255);
+  }
+
+  .theme-light .bg-slate-950 {
+    background-color: rgb(249 250 251);
+  }
+
+  .theme-light .text-slate-400 {
+    color: rgb(55 65 81);
+  }
+
+  .theme-light .text-slate-500 {
+    color: rgb(107 114 128);
+  }
+
+  .theme-light .text-white {
+    color: rgb(17 24 39);
+  }
+
+  .theme-light .border-slate-700\/60 {
+    border-color: rgb(229 231 235 / 0.9);
+  }
+
+  .theme-light .hover\:bg-slate-700:hover {
+    background-color: rgb(243 244 246);
+  }
+
+  .theme-light .hover\:text-slate-100:hover {
+    color: rgb(17 24 39);
+  }
+
+  .theme-light .hover\:text-slate-300:hover {
+    color: rgb(55 65 81);
+  }
+
+  .theme-light .bg-gray-900 {
+    background-color: rgb(255 255 255);
+  }
+
+  .theme-light .bg-gray-900\/50 {
+    background-color: rgb(249 250 251 / 0.65);
+  }
+
+  .theme-light .bg-gray-800 {
+    background-color: rgb(243 244 246);
+  }
+
+  .theme-light .text-gray-100 {
+    color: rgb(17 24 39);
+  }
+
+  .theme-light .text-gray-200 {
+    color: rgb(31 41 55);
+  }
+
+  .theme-light .text-gray-300 {
+    color: rgb(55 65 81);
+  }
+
+  .theme-light .text-gray-400 {
+    color: rgb(75 85 99);
+  }
+
+  .theme-light .text-gray-500 {
+    color: rgb(107 114 128);
+  }
+
+  .theme-light .text-gray-600 {
+    color: rgb(107 114 128);
+  }
+
+  .theme-light .border-gray-700 {
+    border-color: rgb(209 213 219);
+  }
+
+  .theme-light .border-gray-800 {
+    border-color: rgb(229 231 235);
+  }
+
+  .theme-light .border-gray-600\/30 {
+    border-color: rgb(209 213 219 / 0.8);
+  }
+
+  .theme-light .divide-gray-800\/50 > :not([hidden]) ~ :not([hidden]) {
+    border-color: rgb(229 231 235 / 0.8);
+  }
+
+  .theme-light .hover\:bg-gray-800:hover {
+    background-color: rgb(243 244 246);
+  }
+
+  .theme-light .hover\:bg-gray-800\/30:hover {
+    background-color: rgb(243 244 246 / 0.55);
+  }
+
+  .theme-light .hover\:bg-gray-800\/50:hover {
+    background-color: rgb(243 244 246 / 0.8);
+  }
+
+  .theme-light .hover\:bg-gray-750:hover {
+    background-color: rgb(243 244 246);
+  }
+
+  .theme-light .hover\:border-gray-700:hover {
+    border-color: rgb(209 213 219);
+  }
+
+  .theme-light .group:hover .group-hover\:text-gray-400 {
+    color: rgb(75 85 99);
+  }
+}
