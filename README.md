@@ -1,10 +1,12 @@
-﻿# Domain SSL Checker
+﻿# Domain SSL Checker   
+
+![image](/docs/screenshots/main_screen.png)   
 
 Current version: `v1.1.0`   
 
 dockerhub: https://hub.docker.com/r/beztebya666/ssl-domain-exporter   
 
-Domain SSL Checker is a self-hosted service for monitoring SSL certificates and domain registration expiry dates, with a web UI, REST API, SQLite storage, and Prometheus metrics.
+Domain SSL Checker is a self-hosted service for monitoring SSL certificates(+chain validation) and domain registration expiry dates, with a web UI, REST API, SQLite storage, and Prometheus metrics.
 
 ## Features
 
@@ -237,6 +239,19 @@ Flags in `config.yaml -> features`:
 - Ready-to-use files:
 `monitoring/grafana-dashboard.json`
 `monitoring/alertmanager-rules.yaml`
+
+- Some metrics:   
+```
+- domain_check_duration_ms
+- domain_check_success
+- domain_checks_total
+- domain_expiry_days
+- domain_last_check_timestamp
+- domain_monitor_total
+- domain_overall_status
+- domain_ssl_chain_valid (Chain validatition! It's also in the UI.)
+- domain_ssl_expiry_days
+```  
 
 ## Environment Variables
 
