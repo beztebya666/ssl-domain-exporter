@@ -1,4 +1,4 @@
-﻿server:
+server:
   host: "0.0.0.0"
   port: "8080"
 
@@ -55,6 +55,12 @@ notifications:
 domains:
   subdomain_fallback: true
   fallback_depth: 5
+  default_check_mode: "full"   # full | ssl_only — default for newly added domains
+
+dns:
+  servers: []                  # custom DNS servers, e.g. ["10.0.0.1:53", "192.168.1.1:53"]
+  use_system_dns: true         # fallback to system /etc/resolv.conf when custom servers are empty or fail
+  timeout: "5s"                # DNS query timeout
 
 prometheus:
   enabled: true

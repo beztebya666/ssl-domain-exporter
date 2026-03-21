@@ -1,4 +1,4 @@
-﻿package checker
+package checker
 
 import (
 	"bytes"
@@ -20,12 +20,34 @@ type RevocationResult struct {
 	CRLError   string
 }
 
-func CheckRevocation(domain string, port int, timeout time.Duration, checkOCSP bool, checkCRL bool) *RevocationResult {
+func CheckRevocation(domain string, port int, timeout time.Duration, checkOCSP bool, checkCRL bool, rc *ResolveContext) *RevocationResult {
 	result := &RevocationResult{}
 	host, serverName := tlsHost(domain, port)
 
+	// Resolve via custom DNS if needed
+	dialAddr := host
+	if rc != nil && len(rc.Servers) > 0 {
+		h, p := splitHostPort(host)
+		if ip := net.ParseIP(h); ip == nil {
+			resolved, err := rc.ResolveHost(h)
+			if err != nil {
+				errText := fmt.Sprintf("DNS resolve failed: %v", err)
+				if checkOCSP {
+					result.OCSPStatus = "unavailable"
+					result.OCSPError = errText
+				}
+				if checkCRL {
+					result.CRLStatus = "unavailable"
+					result.CRLError = errText
+				}
+				return result
+			}
+			dialAddr = net.JoinHostPort(resolved, p)
+		}
+	}
+
 	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := tls.DialWithDialer(dialer, "tcp", host, &tls.Config{
+	conn, err := tls.DialWithDialer(dialer, "tcp", dialAddr, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         serverName,
 	})

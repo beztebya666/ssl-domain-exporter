@@ -25,7 +25,7 @@ type DomainResult struct {
 	Error      string
 }
 
-// Bootstrap cache — fetched once, reused for 24h
+// Bootstrap cache - fetched once, reused for 24h
 var (
 	bootstrapCache     map[string]string // tld -> rdap base url
 	bootstrapCacheTime time.Time
@@ -53,7 +53,8 @@ type rdapBootstrapJSON struct {
 	Services [][][]string `json:"services"`
 }
 
-func CheckDomain(domain string, timeout time.Duration) *DomainResult {
+// CheckDomainRegistration performs RDAP/WHOIS lookup for domain registration info.
+func CheckDomainRegistration(domain string, timeout time.Duration) *DomainResult {
 	rdapResult := checkRDAP(domain, timeout)
 	if rdapResult.Error == "" {
 		rdapResult.Source = "rdap"
@@ -251,7 +252,7 @@ func extractVCardFN(vcardArray interface{}) string {
 func checkWHOIS(domain string, timeout time.Duration) *DomainResult {
 	result := &DomainResult{}
 
-	raw, err := whois.Whois(domain)
+	raw, err := whoisWithTimeout(domain, timeout)
 	if err != nil {
 		result.Error = fmt.Sprintf("whois query: %v", err)
 		return result
@@ -273,6 +274,26 @@ func checkWHOIS(domain string, timeout time.Duration) *DomainResult {
 	}
 
 	return result
+}
+
+// whoisWithTimeout wraps whois.Whois with a hard timeout.
+// The likexian/whois library does not natively support timeout control.
+func whoisWithTimeout(domain string, timeout time.Duration) (string, error) {
+	type result struct {
+		raw string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		raw, err := whois.Whois(domain)
+		ch <- result{raw, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.raw, r.err
+	case <-time.After(timeout):
+		return "", fmt.Errorf("whois timeout after %s", timeout)
+	}
 }
 
 func parseDate(s string) (*time.Time, *int) {

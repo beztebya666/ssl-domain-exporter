@@ -10,8 +10,11 @@ import {
 } from 'recharts'
 import { fetchDomain, fetchHistory, triggerCheck, updateDomain, fetchFolders } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
+import TagEditor from '../components/TagEditor'
+import MetadataEditor from '../components/MetadataEditor'
 import { format, formatDistanceToNow } from 'date-fns'
 import type { Check as CheckType, ChainCert } from '../types'
+import { metadataSearchText } from '../lib/domainFields'
 
 function InfoRow({ label, value, mono = false }: { label: string; value?: string | number | null; mono?: boolean }) {
   if (!value && value !== 0) return null
@@ -80,12 +83,15 @@ export default function DomainDetail() {
   const [checking, setChecking] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState('')
-  const [editTags, setEditTags] = useState('')
+  const [editTags, setEditTags] = useState<string[]>([])
+  const [editMetadata, setEditMetadata] = useState<Record<string, string>>({})
   const [editEnabled, setEditEnabled] = useState(true)
   const [editInterval, setEditInterval] = useState(21600)
   const [editPort, setEditPort] = useState(443)
   const [editFolderValue, setEditFolderValue] = useState('')
   const [editCustomCAPEM, setEditCustomCAPEM] = useState('')
+  const [editCheckMode, setEditCheckMode] = useState('full')
+  const [editDnsServers, setEditDnsServers] = useState('')
 
   const { data: domain, isLoading } = useQuery({
     queryKey: ['domain', domainId],
@@ -113,11 +119,14 @@ export default function DomainDetail() {
     if (!domain) return
     setEditName(domain.name)
     setEditTags(domain.tags)
+    setEditMetadata(domain.metadata ?? {})
     setEditEnabled(domain.enabled)
     setEditInterval(domain.check_interval)
     setEditPort(domain.port || 443)
     setEditFolderValue(domain.folder_id ? String(domain.folder_id) : '')
     setEditCustomCAPEM(domain.custom_ca_pem ?? '')
+    setEditCheckMode(domain.check_mode || 'full')
+    setEditDnsServers(domain.dns_servers || '')
     setEditing(true)
   }
 
@@ -133,11 +142,13 @@ export default function DomainDetail() {
     }
   }
 
+  const isSSLOnly = domain?.check_mode === 'ssl_only'
+
   // Build chart data from history (reversed, oldest first)
   const chartData = [...history].reverse().map(c => ({
     time: format(new Date(c.checked_at), 'MM/dd HH:mm'),
     ssl: c.ssl_expiry_days,
-    domain: c.domain_expiry_days,
+    domain: c.registration_check_skipped ? null : c.domain_expiry_days,
   }))
 
   if (isLoading) {
@@ -179,11 +190,15 @@ export default function DomainDetail() {
               <button
                 className="btn-primary py-1"
                 onClick={() => updateMutation.mutate({
-                  name: editName, tags: editTags,
+                  name: editName,
+                  tags: editTags,
+                  metadata: editMetadata,
                   enabled: editEnabled, check_interval: editInterval,
                   port: editPort,
-                  folder_id: editFolderValue ? Number(editFolderValue) : 0,
-                  custom_ca_pem: editCustomCAPEM
+                  folder_id: editFolderValue ? Number(editFolderValue) : null,
+                  custom_ca_pem: editCustomCAPEM,
+                  check_mode: editCheckMode,
+                  dns_servers: editDnsServers,
                 })}
               >
                 <Check size={14} /> Save
@@ -196,6 +211,14 @@ export default function DomainDetail() {
             <div className="flex items-center gap-3">
               <h1 className="text-xl font-bold text-white">{domain.name}</h1>
               <StatusBadge status={check?.overall_status ?? 'unknown'} />
+              {domain.tags.map(tag => (
+                <span key={tag.toLowerCase()} className="text-xs text-blue-300 bg-blue-500/10 px-2 py-0.5 rounded-full">
+                  {tag}
+                </span>
+              ))}
+              {domain.check_mode === 'ssl_only' && (
+                <span className="text-xs text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-full">SSL Only</span>
+              )}
               <button className="btn-ghost p-1.5 opacity-60 hover:opacity-100" onClick={startEdit}>
                 <Pencil size={13} />
               </button>
@@ -216,9 +239,13 @@ export default function DomainDetail() {
       {/* Edit extra fields */}
       {editing && (
         <div className="card grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div>
+          <div className="md:col-span-2">
             <label className="label">Tags</label>
-            <input className="input" value={editTags} onChange={e => setEditTags(e.target.value)} />
+            <TagEditor tags={editTags} onChange={setEditTags} />
+          </div>
+          <div className="md:col-span-2">
+            <label className="label">Metadata</label>
+            <MetadataEditor value={editMetadata} onChange={setEditMetadata} />
           </div>
           <div>
             <label className="label">Check interval (seconds)</label>
@@ -244,6 +271,17 @@ export default function DomainDetail() {
               ))}
             </select>
           </div>
+          <div>
+            <label className="label">Check Mode</label>
+            <select className="input" value={editCheckMode} onChange={e => setEditCheckMode(e.target.value)}>
+              <option value="full">Full (SSL + Domain Registration)</option>
+              <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
+            </select>
+          </div>
+          <div>
+            <label className="label">DNS Servers</label>
+            <input className="input" value={editDnsServers} onChange={e => setEditDnsServers(e.target.value)} placeholder="10.0.0.1:53, 10.0.0.2:53" />
+          </div>
           <div className="md:col-span-4">
             <label className="label">Custom Root CA (PEM)</label>
             <textarea
@@ -258,6 +296,22 @@ export default function DomainDetail() {
 
       {/* Info panels */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="card space-y-0">
+          <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
+            <Server size={15} className="text-cyan-400" /> Inventory Metadata
+          </h3>
+          <InfoRow label="Tags" value={domain.tags.join(', ')} />
+          {Object.keys(domain.metadata ?? {}).length === 0 ? (
+            <div className="text-sm text-gray-500">No metadata configured.</div>
+          ) : (
+            Object.entries(domain.metadata)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([key, value]) => (
+                <InfoRow key={key} label={key} value={value} mono />
+              ))
+          )}
+        </div>
+
         {/* SSL Panel */}
         <div className="card space-y-0">
           <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
@@ -292,8 +346,19 @@ export default function DomainDetail() {
         <div className="card space-y-0">
           <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
             <Globe size={15} className="text-green-400" /> Domain Registration
+            {check?.registration_check_skipped && (
+              <span className="text-xs text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded ml-1">skipped</span>
+            )}
           </h3>
-          {check?.domain_check_error ? (
+          {check?.registration_check_skipped ? (
+            <div className="space-y-0">
+              <InfoRow label="Check mode" value="SSL Only" />
+              <InfoRow label="Reason" value={check.registration_skip_reason || 'check_mode=ssl_only'} />
+              <InfoRow label="Port" value={domain.port || 443} />
+              <InfoRow label="Custom CA" value={domain.custom_ca_pem?.trim() ? 'Configured' : 'Default trust store'} />
+              {check.dns_server_used && <InfoRow label="DNS server" value={check.dns_server_used} />}
+            </div>
+          ) : check?.domain_check_error ? (
             <div className="flex items-center gap-2 text-yellow-400 text-sm">
               <AlertTriangle size={14} /> {check.domain_check_error}
             </div>
@@ -304,6 +369,7 @@ export default function DomainDetail() {
               <InfoRow label="Source" value={check?.domain_source} />
               <InfoRow label="Port" value={domain.port || 443} />
               <InfoRow label="Custom CA" value={domain.custom_ca_pem?.trim() ? 'Configured' : 'Default trust store'} />
+              {check?.dns_server_used && <InfoRow label="DNS server" value={check.dns_server_used} />}
               <InfoRow
                 label="Registered"
                 value={check?.domain_created_at ? format(new Date(check.domain_created_at), 'yyyy-MM-dd') : undefined}
@@ -369,12 +435,20 @@ export default function DomainDetail() {
                 type="monotone" dataKey="ssl" name="SSL expiry (days)"
                 stroke={CHART_COLORS.ssl} strokeWidth={2} dot={false} connectNulls
               />
-              <Line
-                type="monotone" dataKey="domain" name="Domain expiry (days)"
-                stroke={CHART_COLORS.domain} strokeWidth={2} dot={false} connectNulls
-              />
+              {!isSSLOnly && (
+                <Line
+                  type="monotone" dataKey="domain" name="Domain expiry (days)"
+                  stroke={CHART_COLORS.domain} strokeWidth={2} dot={false} connectNulls
+                />
+              )}
             </LineChart>
           </ResponsiveContainer>
+        </div>
+      )}
+
+      {!editing && Object.keys(domain.metadata ?? {}).length > 0 && (
+        <div className="rounded-xl border border-gray-800 bg-gray-900/40 p-4 text-xs text-gray-400">
+          Search text: <span className="font-mono text-gray-300">{metadataSearchText(domain.metadata)}</span>
         </div>
       )}
 
@@ -468,7 +542,7 @@ export default function DomainDetail() {
                       {c.ssl_expiry_days != null ? `${c.ssl_expiry_days}d` : '-'}
                     </td>
                     <td className="py-2 text-gray-300">
-                      {c.domain_expiry_days != null ? `${c.domain_expiry_days}d` : '-'}
+                      {c.registration_check_skipped ? <span className="text-gray-600">N/A</span> : c.domain_expiry_days != null ? `${c.domain_expiry_days}d` : '-'}
                     </td>
                     <td className="py-2">
                       {c.ssl_check_error ? (

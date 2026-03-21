@@ -28,6 +28,7 @@ import ExpiryBar from '../components/ExpiryBar'
 import AddDomainModal from '../components/AddDomainModal'
 import { formatDistanceToNow } from 'date-fns'
 import type { Domain } from '../types'
+import { metadataSearchText, tagsToText } from '../lib/domainFields'
 
 type SortMode = 'custom' | 'alphabetical' | 'status' | 'created_at' | 'domain_expiry' | 'ssl_expiry'
 
@@ -104,7 +105,10 @@ export default function Domains() {
   const filteredBase = useMemo(() => {
     return sortedByCustom.filter(d => {
       const searchText = search.toLowerCase()
-      const matchSearch = d.name.toLowerCase().includes(searchText) || d.tags.toLowerCase().includes(searchText)
+      const matchSearch =
+        d.name.toLowerCase().includes(searchText) ||
+        tagsToText(d.tags).toLowerCase().includes(searchText) ||
+        metadataSearchText(d.metadata).toLowerCase().includes(searchText)
       const matchStatus =
         statusFilter === 'all' ||
         d.last_check?.overall_status === statusFilter ||
@@ -197,7 +201,7 @@ export default function Domains() {
           <label className="label">Search</label>
           <input
             className="input"
-            placeholder="Search domains or tags..."
+            placeholder="Search domains, tags, or metadata..."
             value={search}
             onChange={e => setSearch(e.target.value)}
           />
@@ -272,14 +276,24 @@ export default function Domains() {
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-medium text-gray-100">{d.name}{d.port && d.port !== 443 ? `:${d.port}` : ''}</span>
                     <StatusBadge status={d.last_check?.overall_status ?? 'unknown'} />
-                    {d.tags && (
+                    {d.tags.length > 0 && (
                       <div className="flex items-center gap-1 text-xs text-gray-500">
                         <Tag size={11} />
-                        {d.tags}
+                        {d.tags.map(tag => (
+                          <span key={tag.toLowerCase()} className="rounded-full border border-blue-500/20 bg-blue-500/10 px-2 py-0.5 text-blue-300">
+                            {tag}
+                          </span>
+                        ))}
                       </div>
+                    )}
+                    {d.check_mode === 'ssl_only' && (
+                      <span className="text-xs text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-full">SSL Only</span>
                     )}
                     {d.custom_ca_pem?.trim() && (
                       <span className="text-xs text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded-full">custom CA</span>
+                    )}
+                    {d.dns_servers?.trim() && (
+                      <span className="text-xs text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full">custom DNS</span>
                     )}
                     {!d.enabled && (
                       <span className="text-xs text-gray-600 bg-gray-800 px-2 py-0.5 rounded-full">disabled</span>
@@ -291,13 +305,18 @@ export default function Domains() {
                       Last checked {formatDistanceToNow(new Date(d.last_check.checked_at), { addSuffix: true })}
                       {d.last_check.ssl_version && ` | ${d.last_check.ssl_version}`}
                       {d.last_check.ssl_issuer && ` | ${d.last_check.ssl_issuer}`}
+                      {metadataSearchText(d.metadata) && ` | ${metadataSearchText(d.metadata)}`}
                     </div>
                   )}
                 </div>
 
                 <div className="w-48 space-y-1 hidden xl:block">
                   <ExpiryBar days={d.last_check?.ssl_expiry_days} label="SSL" />
-                  <ExpiryBar days={d.last_check?.domain_expiry_days} label="Domain" />
+                  {d.check_mode === 'ssl_only' ? (
+                    <div className="text-xs text-gray-600">Domain: N/A</div>
+                  ) : (
+                    <ExpiryBar days={d.last_check?.domain_expiry_days} label="Domain" />
+                  )}
                 </div>
 
                 <div className="flex items-center gap-1.5 flex-shrink-0">

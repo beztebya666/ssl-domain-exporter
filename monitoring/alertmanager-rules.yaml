@@ -11,7 +11,7 @@
           description: "SSL for {{ $labels.domain }} expires in {{ $value }} days"
 
       - alert: DomainRegistrationExpiryCritical
-        expr: domain_expiry_days <= 7
+        expr: domain_expiry_days <= 7 and domain_registration_check_enabled == 1
         for: 10m
         labels:
           severity: critical

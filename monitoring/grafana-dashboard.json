@@ -50,8 +50,27 @@
       "fieldConfig": {"defaults": {"unit": "d"}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
       "id": 5,
-      "targets": [{"expr": "domain_expiry_days", "legendFormat": "{{domain}}", "refId": "A"}],
-      "title": "Domain Expiry Days",
+      "targets": [{"expr": "domain_expiry_days and domain_registration_check_enabled == 1", "legendFormat": "{{domain}}", "refId": "A"}],
+      "title": "Domain Expiry Days (registration-checked only)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 22},
+      "id": 8,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"expr": "count(domain_registration_check_enabled == 0)", "refId": "A"}],
+      "title": "SSL-Only Domains (no registration check)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 22},
+      "id": 9,
+      "targets": [{"expr": "domain_registration_check_skipped_total", "legendFormat": "{{domain}}", "refId": "A"}],
+      "title": "Registration Checks Skipped (cumulative)",
       "type": "timeseries"
     },
     {
@@ -80,8 +99,8 @@
   "templating": {"list": []},
   "time": {"from": "now-24h", "to": "now"},
   "timezone": "",
-  "title": "Domain SSL Checker",
-  "uid": "domain-ssl-checker",
+  "title": "SSL Domain Exporter",
+  "uid": "ssl-domain-exporter",
   "version": 1,
   "weekStart": ""
 }

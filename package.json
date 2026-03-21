@@ -1,5 +1,19 @@
 {
-  "dependencies": {
-    "build": "^0.1.4"
+  "name": "ssl-domain-exporter",
+  "private": true,
+  "version": "1.2.0",
+  "description": "Helper scripts for the SSL Domain Exporter frontend workspace",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "npm run frontend:dev",
+    "build": "npm run frontend:build",
+    "preview": "npm run frontend:preview",
+    "install:frontend": "npm run frontend:install",
+    "frontend:install": "npm --prefix frontend install",
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "frontend:preview": "npm --prefix frontend run preview"
   }
 }

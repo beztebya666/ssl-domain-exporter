@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { Domain, Check, Summary, AppConfig, Folder } from '../types'
+import type { Domain, Check, Summary, AppConfig, Folder, DomainWritePayload, DomainImportRequest, DomainImportResponse } from '../types'
 
 const api = axios.create({
   baseURL: '/api',
@@ -88,18 +88,14 @@ export const fetchDomains = (): Promise<Domain[]> =>
 export const fetchDomain = (id: number): Promise<Domain> =>
   api.get(`/domains/${id}`).then(r => r.data)
 
-export const createDomain = (data: {
-  name: string
-  tags?: string
-  check_interval?: number
-  custom_ca_pem?: string
-  port?: number
-  folder_id?: number | null
-}): Promise<Domain> =>
+export const createDomain = (data: DomainWritePayload): Promise<Domain> =>
   api.post('/domains', data).then(r => r.data)
 
-export const updateDomain = (id: number, data: Partial<Domain>): Promise<Domain> =>
+export const updateDomain = (id: number, data: DomainWritePayload): Promise<Domain> =>
   api.put(`/domains/${id}`, data).then(r => r.data)
+
+export const importDomains = (data: DomainImportRequest): Promise<DomainImportResponse> =>
+  api.post('/domains/import', data).then(r => r.data)
 
 export const deleteDomain = (id: number): Promise<void> =>
   api.delete(`/domains/${id}`).then(r => r.data)

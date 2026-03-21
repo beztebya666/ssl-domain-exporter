@@ -1,4 +1,4 @@
-﻿package checker
+package checker
 
 import (
 	"crypto/tls"
@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"domain-ssl-checker/internal/db"
+	"ssl-domain-exporter/internal/db"
 )
 
 type SSLResult struct {
@@ -26,12 +26,27 @@ type SSLResult struct {
 	Error       string
 }
 
-func CheckSSL(domain string, port int, timeout time.Duration, customCAPEM string) *SSLResult {
+func CheckSSL(domain string, port int, timeout time.Duration, customCAPEM string, rc *ResolveContext) *SSLResult {
 	result := &SSLResult{}
 	hostPort, serverName := tlsHost(domain, port)
 
+	// If we have custom DNS, resolve the hostname first and connect to the IP
+	dialAddr := hostPort
+	if rc != nil && len(rc.Servers) > 0 {
+		host, portStr := splitHostPort(hostPort)
+		if ip := net.ParseIP(host); ip == nil {
+			// hostname needs resolution
+			resolved, err := rc.ResolveHost(host)
+			if err != nil {
+				result.Error = fmt.Sprintf("DNS resolve failed: %v", err)
+				return result
+			}
+			dialAddr = net.JoinHostPort(resolved, portStr)
+		}
+	}
+
 	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := tls.DialWithDialer(dialer, "tcp", hostPort, &tls.Config{
+	conn, err := tls.DialWithDialer(dialer, "tcp", dialAddr, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         serverName,
 	})
@@ -143,4 +158,13 @@ func tlsVersionString(v uint16) string {
 	default:
 		return fmt.Sprintf("TLS 0x%04X", v)
 	}
+}
+
+// splitHostPort is a helper that splits host:port, tolerating missing port.
+func splitHostPort(addr string) (host, port string) {
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, "443"
+	}
+	return h, p
 }

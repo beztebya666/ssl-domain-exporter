@@ -1,4 +1,4 @@
-﻿package api
+package api
 
 import (
 	"log"
@@ -10,10 +10,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"domain-ssl-checker/internal/checker"
-	"domain-ssl-checker/internal/config"
-	"domain-ssl-checker/internal/db"
-	"domain-ssl-checker/internal/metrics"
+	"ssl-domain-exporter/internal/checker"
+	"ssl-domain-exporter/internal/config"
+	"ssl-domain-exporter/internal/db"
+	"ssl-domain-exporter/internal/metrics"
 )
 
 func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched *checker.Scheduler, m *metrics.Metrics) http.Handler {
@@ -56,6 +56,7 @@ func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched 
 
 		api.GET("/domains", h.ListDomains)
 		api.POST("/domains", h.CreateDomain)
+		api.POST("/domains/import", h.ImportDomains)
 		api.POST("/domains/reorder", h.ReorderDomains)
 		api.GET("/domains/export.csv", h.ExportDomainsCSV)
 		api.GET("/domains/:id", h.GetDomain)

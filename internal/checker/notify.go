@@ -1,4 +1,4 @@
-﻿package checker
+package checker
 
 import (
 	"bytes"
@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"domain-ssl-checker/internal/config"
-	"domain-ssl-checker/internal/db"
+	"ssl-domain-exporter/internal/config"
+	"ssl-domain-exporter/internal/db"
 )
 
 type Notifier struct {
@@ -22,24 +22,26 @@ func NewNotifier(cfg *config.Config) *Notifier {
 }
 
 func (n *Notifier) Notify(domain string, check *db.Check, prevStatus string) {
-	if !n.cfg.Features.Notifications {
+	cfg := n.cfg.Snapshot()
+
+	if !cfg.Features.Notifications {
 		return
 	}
 	if check.OverallStatus == prevStatus {
 		return
 	}
 
-	message := n.buildMessage(domain, check, prevStatus)
+	message := buildMessage(domain, check, prevStatus)
 
-	if n.cfg.Notifications.Webhook.Enabled && n.cfg.Notifications.Webhook.URL != "" {
-		if shouldNotifyStatus(check.OverallStatus, n.cfg.Notifications.Webhook.OnCritical, n.cfg.Notifications.Webhook.OnWarning) {
-			go n.sendWebhook(message)
+	if cfg.Notifications.Webhook.Enabled && cfg.Notifications.Webhook.URL != "" {
+		if shouldNotifyStatus(check.OverallStatus, cfg.Notifications.Webhook.OnCritical, cfg.Notifications.Webhook.OnWarning) {
+			go sendWebhook(cfg.Notifications.Webhook.URL, message)
 		}
 	}
 
-	if n.cfg.Notifications.Telegram.Enabled && n.cfg.Notifications.Telegram.BotToken != "" && n.cfg.Notifications.Telegram.ChatID != "" {
-		if shouldNotifyStatus(check.OverallStatus, n.cfg.Notifications.Telegram.OnCritical, n.cfg.Notifications.Telegram.OnWarning) {
-			go n.sendTelegram(message)
+	if cfg.Notifications.Telegram.Enabled && cfg.Notifications.Telegram.BotToken != "" && cfg.Notifications.Telegram.ChatID != "" {
+		if shouldNotifyStatus(check.OverallStatus, cfg.Notifications.Telegram.OnCritical, cfg.Notifications.Telegram.OnWarning) {
+			go sendTelegram(cfg.Notifications.Telegram.BotToken, cfg.Notifications.Telegram.ChatID, message)
 		}
 	}
 }
@@ -55,7 +57,7 @@ func shouldNotifyStatus(status string, onCritical bool, onWarning bool) bool {
 	}
 }
 
-func (n *Notifier) buildMessage(domain string, check *db.Check, prevStatus string) string {
+func buildMessage(domain string, check *db.Check, prevStatus string) string {
 	lines := []string{
 		"Domain Monitor Alert",
 		"",
@@ -66,8 +68,15 @@ func (n *Notifier) buildMessage(domain string, check *db.Check, prevStatus strin
 	if check.SSLExpiryDays != nil {
 		lines = append(lines, fmt.Sprintf("SSL expires in: %d days", *check.SSLExpiryDays))
 	}
-	if check.DomainExpiryDays != nil {
-		lines = append(lines, fmt.Sprintf("Domain expires in: %d days", *check.DomainExpiryDays))
+	if !check.RegistrationCheckSkipped {
+		if check.DomainExpiryDays != nil {
+			lines = append(lines, fmt.Sprintf("Domain expires in: %d days", *check.DomainExpiryDays))
+		}
+		if check.DomainCheckError != "" {
+			lines = append(lines, fmt.Sprintf("Domain error: %s", check.DomainCheckError))
+		}
+	} else {
+		lines = append(lines, "Domain registration: not checked (ssl_only)")
 	}
 	if check.HTTPStatusCode > 0 {
 		lines = append(lines, fmt.Sprintf("HTTP status: %d", check.HTTPStatusCode))
@@ -84,17 +93,17 @@ func (n *Notifier) buildMessage(domain string, check *db.Check, prevStatus strin
 	if check.SSLCheckError != "" {
 		lines = append(lines, fmt.Sprintf("SSL error: %s", check.SSLCheckError))
 	}
-	if check.DomainCheckError != "" {
-		lines = append(lines, fmt.Sprintf("Domain error: %s", check.DomainCheckError))
+	if check.DNSServerUsed != "" {
+		lines = append(lines, fmt.Sprintf("DNS: %s", check.DNSServerUsed))
 	}
 	lines = append(lines, fmt.Sprintf("Checked at: %s", check.CheckedAt.Format(time.RFC3339)))
 
 	return strings.Join(lines, "\n")
 }
 
-func (n *Notifier) sendWebhook(message string) {
+func sendWebhook(url string, message string) {
 	payload, _ := json.Marshal(map[string]string{"text": message})
-	resp, err := http.Post(n.cfg.Notifications.Webhook.URL, "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("[notify] webhook error: %v", err)
 		return
@@ -107,13 +116,13 @@ func (n *Notifier) sendWebhook(message string) {
 	log.Printf("[notify] webhook sent")
 }
 
-func (n *Notifier) sendTelegram(message string) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", n.cfg.Notifications.Telegram.BotToken)
+func sendTelegram(botToken, chatID, message string) {
+	telegramURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
 	payload, _ := json.Marshal(map[string]string{
-		"chat_id": n.cfg.Notifications.Telegram.ChatID,
+		"chat_id": chatID,
 		"text":    message,
 	})
-	resp, err := http.Post(url, "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(telegramURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("[notify] telegram error: %v", err)
 		return
