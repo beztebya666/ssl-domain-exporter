@@ -147,7 +147,7 @@ The effective DNS server used is recorded in each check as `dns_server_used` for
 ## Requirements
 
 - Go `1.21+`
-- Node.js `20.19+` and npm
+- Node.js `20.17+` and npm
 - Network access (RDAP/WHOIS/DNS/OCSP/CRL requests)
 
 ## Quick Start (Local)
