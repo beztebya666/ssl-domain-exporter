@@ -1,4 +1,4 @@
-﻿package api
+package api
 
 import (
 	"encoding/csv"
@@ -12,10 +12,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"domain-ssl-checker/internal/checker"
-	"domain-ssl-checker/internal/config"
-	"domain-ssl-checker/internal/db"
-	"domain-ssl-checker/internal/metrics"
+	"ssl-domain-exporter/internal/checker"
+	"ssl-domain-exporter/internal/config"
+	"ssl-domain-exporter/internal/db"
+	"ssl-domain-exporter/internal/metrics"
 )
 
 type Handler struct {
@@ -47,31 +47,28 @@ func (h *Handler) ListDomains(c *gin.Context) {
 		}
 	}
 
-	h.metrics.SetTotalDomains(len(domains))
+	if h.metrics != nil {
+		h.metrics.SetTotalDomains(len(domains))
+	}
 	c.JSON(http.StatusOK, domains)
 }
 
 // POST /api/domains
 func (h *Handler) CreateDomain(c *gin.Context) {
-	var req struct {
-		Name        string `json:"name" binding:"required"`
-		Tags        string `json:"tags"`
-		CustomCAPEM string `json:"custom_ca_pem"`
-		Interval    int    `json:"check_interval"`
-		Port        int    `json:"port"`
-		FolderID    *int64 `json:"folder_id"`
-	}
+	var req createDomainRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	name := normalizeDomain(req.Name)
-	folderID := req.FolderID
-	if folderID != nil && *folderID <= 0 {
-		folderID = nil
+	cfg := h.cfg.Snapshot()
+	in, err := buildCreateInput(req, cfg)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
-	dom, err := h.db.CreateDomain(name, req.Tags, strings.TrimSpace(req.CustomCAPEM), req.Interval, req.Port, folderID)
+
+	dom, err := h.db.CreateDomain(in.Name, in.Tags, in.Metadata, in.CustomCAPEM, in.CheckMode, in.DNSServers, in.Interval, in.Port, in.FolderID)
 	if err != nil {
 		if isDomainAlreadyExistsErr(err) {
 			c.JSON(http.StatusConflict, gin.H{"error": "domain already exists"})
@@ -81,7 +78,22 @@ func (h *Handler) CreateDomain(c *gin.Context) {
 		return
 	}
 
-	h.scheduler.TriggerCheck(dom)
+	if in.HasEnabled && !in.Enabled {
+		if err := h.db.UpdateDomain(dom.ID, dom.Name, dom.Tags, dom.Metadata, dom.CustomCAPEM, dom.CheckMode, dom.DNSServers, false, dom.CheckInterval, dom.Port, dom.FolderID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		dom, _ = h.db.GetDomainByID(dom.ID)
+	}
+
+	if dom != nil && h.metrics != nil {
+		h.metrics.SyncDomain(dom)
+		h.refreshTotalDomainsMetric()
+	}
+
+	if dom != nil && dom.Enabled && h.scheduler != nil {
+		h.scheduler.TriggerCheck(dom)
+	}
 	c.JSON(http.StatusCreated, dom)
 }
 
@@ -116,15 +128,7 @@ func (h *Handler) UpdateDomain(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		Name        string  `json:"name" binding:"required"`
-		Tags        string  `json:"tags"`
-		CustomCAPEM *string `json:"custom_ca_pem"`
-		Enabled     bool    `json:"enabled"`
-		Interval    int     `json:"check_interval"`
-		Port        int     `json:"port"`
-		FolderID    *int64  `json:"folder_id"`
-	}
+	var req updateDomainRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -140,24 +144,61 @@ func (h *Handler) UpdateDomain(c *gin.Context) {
 		return
 	}
 
-	customCAPEM := current.CustomCAPEM
-	if req.CustomCAPEM != nil {
-		customCAPEM = strings.TrimSpace(*req.CustomCAPEM)
-	}
-	port := current.Port
-	if req.Port > 0 {
-		port = req.Port
-	}
-	folderID := current.FolderID
-	if req.FolderID != nil {
-		if *req.FolderID <= 0 {
-			folderID = nil
-		} else {
-			folderID = req.FolderID
-		}
+	in, err := buildUpdateInput(req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
-	if err := h.db.UpdateDomain(id, normalizeDomain(req.Name), req.Tags, customCAPEM, req.Enabled, req.Interval, port, folderID); err != nil {
+	newName := current.Name
+	if in.HasName {
+		newName = in.Name
+	}
+	tags := append([]string(nil), current.Tags...)
+	if in.HasTags {
+		tags = in.Tags
+	}
+	metadata := cloneMetadata(current.Metadata)
+	if in.HasMetadata {
+		metadata = cloneMetadata(in.Metadata)
+	}
+	customCAPEM := current.CustomCAPEM
+	if in.HasCustomCAPEM {
+		customCAPEM = in.CustomCAPEM
+	}
+	checkMode := current.CheckMode
+	if in.HasCheckMode {
+		checkMode = in.CheckMode
+	}
+	dnsServers := current.DNSServers
+	if in.HasDNSServers {
+		dnsServers = in.DNSServers
+	}
+	enabled := current.Enabled
+	if in.HasEnabled {
+		enabled = in.Enabled
+	}
+	interval := current.CheckInterval
+	if in.HasInterval && in.Interval > 0 {
+		interval = in.Interval
+	}
+	port := current.Port
+	if in.HasPort && in.Port > 0 {
+		port = in.Port
+	}
+	folderID := cloneFolderID(current.FolderID)
+	if in.HasFolderID {
+		folderID = in.FolderID
+	}
+
+	needsRecheck := newName != current.Name ||
+		checkMode != current.CheckMode ||
+		dnsServers != current.DNSServers ||
+		customCAPEM != current.CustomCAPEM ||
+		port != current.Port ||
+		(!current.Enabled && enabled)
+
+	if err := h.db.UpdateDomain(id, newName, tags, metadata, customCAPEM, checkMode, dnsServers, enabled, interval, port, folderID); err != nil {
 		if isDomainAlreadyExistsErr(err) {
 			c.JSON(http.StatusConflict, gin.H{"error": "domain already exists"})
 			return
@@ -166,8 +207,186 @@ func (h *Handler) UpdateDomain(c *gin.Context) {
 		return
 	}
 
+	if current.Name != newName && h.metrics != nil {
+		h.metrics.CleanupDomain(current.Name)
+	}
+
 	dom, _ := h.db.GetDomainByID(id)
+	if dom != nil && h.metrics != nil {
+		h.metrics.SyncDomain(dom)
+	}
+
+	// Trigger immediate re-check when check-affecting fields changed
+	if needsRecheck && dom != nil && dom.Enabled && h.scheduler != nil {
+		h.scheduler.TriggerCheck(dom)
+	}
+
 	c.JSON(http.StatusOK, dom)
+}
+
+// POST /api/domains/import
+func (h *Handler) ImportDomains(c *gin.Context) {
+	var req importDomainsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "create_only"
+	}
+	if mode != "create_only" && mode != "upsert" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mode must be create_only or upsert"})
+		return
+	}
+
+	cfg := h.cfg.Snapshot()
+	defaults, err := parseImportMap(req.Defaults, false)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("defaults: %v", err)})
+		return
+	}
+	if !defaults.HasCheckMode {
+		defaults.CheckMode = config.ValidateCheckMode(cfg.Domains.DefaultCheckMode)
+		defaults.HasCheckMode = true
+	}
+
+	existingDomains, err := h.db.GetDomains()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	existingByName := make(map[string]*db.Domain, len(existingDomains))
+	for i := range existingDomains {
+		domainCopy := existingDomains[i]
+		existingByName[domainCopy.Name] = cloneDomain(&domainCopy)
+	}
+
+	resp := importDomainsResponse{
+		Mode:    mode,
+		DryRun:  req.DryRun,
+		Results: make([]importDomainResult, 0, len(req.Domains)),
+	}
+
+	for idx, raw := range req.Domains {
+		item, err := parseImportMap(raw, true)
+		if err != nil {
+			resp.Summary.Failed++
+			resp.Results = append(resp.Results, importDomainResult{
+				Index:  idx,
+				Action: "failed",
+				Error:  err.Error(),
+			})
+			continue
+		}
+		item = mergeImportDefaults(defaults, item)
+
+		result := importDomainResult{
+			Index: idx,
+			Name:  item.Name,
+		}
+
+		current := existingByName[item.Name]
+		if current == nil {
+			preview := buildImportedDomain(cfg, nil, item)
+			if req.DryRun {
+				result.Action = "create"
+				result.Domain = preview
+				resp.Summary.Created++
+				resp.Results = append(resp.Results, result)
+				existingByName[preview.Name] = cloneDomain(preview)
+				continue
+			}
+
+			created, err := h.db.CreateDomain(preview.Name, preview.Tags, preview.Metadata, preview.CustomCAPEM, preview.CheckMode, preview.DNSServers, preview.CheckInterval, preview.Port, preview.FolderID)
+			if err != nil {
+				result.Action = "failed"
+				result.Error = err.Error()
+				resp.Summary.Failed++
+				resp.Results = append(resp.Results, result)
+				continue
+			}
+
+			if !preview.Enabled {
+				if err := h.db.UpdateDomain(created.ID, created.Name, created.Tags, created.Metadata, created.CustomCAPEM, created.CheckMode, created.DNSServers, false, created.CheckInterval, created.Port, created.FolderID); err != nil {
+					result.Action = "failed"
+					result.Error = err.Error()
+					resp.Summary.Failed++
+					resp.Results = append(resp.Results, result)
+					continue
+				}
+				created, _ = h.db.GetDomainByID(created.ID)
+			}
+
+			if created != nil {
+				existingByName[created.Name] = cloneDomain(created)
+				if h.metrics != nil {
+					h.metrics.SyncDomain(created)
+				}
+				if req.TriggerChecks && created.Enabled && h.scheduler != nil {
+					h.scheduler.TriggerCheck(created)
+				}
+			}
+
+			result.Action = "created"
+			result.Domain = created
+			resp.Summary.Created++
+			resp.Results = append(resp.Results, result)
+			continue
+		}
+
+		if mode == "create_only" {
+			result.Action = "skipped"
+			result.Error = "domain already exists"
+			result.Domain = cloneDomain(current)
+			resp.Summary.Skipped++
+			resp.Results = append(resp.Results, result)
+			continue
+		}
+
+		preview := buildImportedDomain(cfg, current, item)
+		if req.DryRun {
+			result.Action = "update"
+			result.Domain = preview
+			resp.Summary.Updated++
+			resp.Results = append(resp.Results, result)
+			existingByName[preview.Name] = cloneDomain(preview)
+			continue
+		}
+
+		if err := h.db.UpdateDomain(current.ID, preview.Name, preview.Tags, preview.Metadata, preview.CustomCAPEM, preview.CheckMode, preview.DNSServers, preview.Enabled, preview.CheckInterval, preview.Port, preview.FolderID); err != nil {
+			result.Action = "failed"
+			result.Error = err.Error()
+			resp.Summary.Failed++
+			resp.Results = append(resp.Results, result)
+			continue
+		}
+
+		updated, _ := h.db.GetDomainByID(current.ID)
+		if updated != nil {
+			existingByName[updated.Name] = cloneDomain(updated)
+			if h.metrics != nil {
+				h.metrics.SyncDomain(updated)
+			}
+			if req.TriggerChecks && updated.Enabled && h.scheduler != nil {
+				h.scheduler.TriggerCheck(updated)
+			}
+		}
+
+		result.Action = "updated"
+		result.Domain = updated
+		resp.Summary.Updated++
+		resp.Results = append(resp.Results, result)
+	}
+
+	resp.Summary.Total = len(req.Domains)
+	if h.metrics != nil && !req.DryRun {
+		h.refreshTotalDomainsMetric()
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 // DELETE /api/domains/:id
@@ -178,9 +397,17 @@ func (h *Handler) DeleteDomain(c *gin.Context) {
 		return
 	}
 
+	// Fetch domain name before deletion so we can clean up metrics
+	dom, _ := h.db.GetDomainByID(id)
+
 	if err := h.db.DeleteDomain(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+
+	if dom != nil && h.metrics != nil {
+		h.metrics.CleanupDomain(dom.Name)
+		h.refreshTotalDomainsMetric()
 	}
 
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -339,7 +566,8 @@ func (h *Handler) GetHistory(c *gin.Context) {
 
 // GET /api/domains/export.csv
 func (h *Handler) ExportDomainsCSV(c *gin.Context) {
-	if !h.cfg.Features.CSVExport {
+	cfg := h.cfg.Snapshot()
+	if !cfg.Features.CSVExport {
 		c.JSON(http.StatusForbidden, gin.H{"error": "csv export is disabled"})
 		return
 	}
@@ -358,7 +586,8 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 	defer w.Flush()
 
 	header := []string{
-		"id", "domain", "port", "folder_id", "tags", "custom_ca", "enabled", "status", "ssl_expiry_days", "domain_expiry_days",
+		"id", "domain", "port", "folder_id", "tags", "metadata", "custom_ca", "check_mode", "dns_servers", "enabled", "status",
+		"ssl_expiry_days", "domain_expiry_days", "registration_check_skipped",
 		"http_status_code", "http_response_time_ms", "http_redirects_https", "http_hsts_enabled", "checked_at",
 	}
 	_ = w.Write(header)
@@ -369,10 +598,14 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 			d.Name,
 			strconv.Itoa(d.Port),
 			"",
-			d.Tags,
+			db.JoinTags(d.Tags),
+			marshalMetadataCSV(d.Metadata),
 			strconv.FormatBool(strings.TrimSpace(d.CustomCAPEM) != ""),
+			d.EffectiveCheckMode(),
+			d.DNSServers,
 			strconv.FormatBool(d.Enabled),
 			"unknown",
+			"",
 			"",
 			"",
 			"",
@@ -385,18 +618,24 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 			row[3] = strconv.FormatInt(*d.FolderID, 10)
 		}
 		if chk, ok := lastChecks[d.ID]; ok {
-			row[7] = chk.OverallStatus
+			row[10] = chk.OverallStatus
 			if chk.SSLExpiryDays != nil {
-				row[8] = strconv.Itoa(*chk.SSLExpiryDays)
+				row[11] = strconv.Itoa(*chk.SSLExpiryDays)
 			}
-			if chk.DomainExpiryDays != nil {
-				row[9] = strconv.Itoa(*chk.DomainExpiryDays)
+			if chk.RegistrationCheckSkipped {
+				row[12] = "N/A"
+				row[13] = "true"
+			} else {
+				if chk.DomainExpiryDays != nil {
+					row[12] = strconv.Itoa(*chk.DomainExpiryDays)
+				}
+				row[13] = "false"
 			}
-			row[10] = strconv.Itoa(chk.HTTPStatusCode)
-			row[11] = strconv.FormatInt(chk.HTTPResponseTimeMs, 10)
-			row[12] = strconv.FormatBool(chk.HTTPRedirectsHTTPS)
-			row[13] = strconv.FormatBool(chk.HTTPHSTSEnabled)
-			row[14] = chk.CheckedAt.Format("2006-01-02 15:04:05")
+			row[14] = strconv.Itoa(chk.HTTPStatusCode)
+			row[15] = strconv.FormatInt(chk.HTTPResponseTimeMs, 10)
+			row[16] = strconv.FormatBool(chk.HTTPRedirectsHTTPS)
+			row[17] = strconv.FormatBool(chk.HTTPHSTSEnabled)
+			row[18] = chk.CheckedAt.Format("2006-01-02 15:04:05")
 		}
 		_ = w.Write(row)
 	}
@@ -404,7 +643,7 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 
 // GET /api/config
 func (h *Handler) GetConfig(c *gin.Context) {
-	c.JSON(http.StatusOK, h.cfg.Clone())
+	c.JSON(http.StatusOK, h.cfg.Snapshot())
 }
 
 // PUT /api/config
@@ -415,7 +654,7 @@ func (h *Handler) UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	next := h.cfg.Clone()
+	next := h.cfg.Snapshot()
 	if err := json.Unmarshal(body, next); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -427,42 +666,46 @@ func (h *Handler) UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, h.cfg.Clone())
+	c.JSON(http.StatusOK, h.cfg.Snapshot())
 }
 
 // GET /api/settings (compatibility endpoint)
 func (h *Handler) GetSettings(c *gin.Context) {
-	cfg := h.cfg
+	cfg := h.cfg.Snapshot()
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"checker_interval":              cfg.Checker.Interval,
-		"checker_timeout":               cfg.Checker.Timeout,
-		"checker_concurrent_checks":     cfg.Checker.ConcurrentChecks,
-		"prometheus_enabled":            cfg.Prometheus.Enabled,
-		"prometheus_path":               cfg.Prometheus.Path,
-		"alert_domain_expiry_warning":   cfg.Alerts.DomainExpiryWarningDays,
-		"alert_domain_expiry_critical":  cfg.Alerts.DomainExpiryCriticalDays,
-		"alert_ssl_expiry_warning":      cfg.Alerts.SSLExpiryWarningDays,
-		"alert_ssl_expiry_critical":     cfg.Alerts.SSLExpiryCriticalDays,
-		"notifications_enabled":         cfg.Features.Notifications,
-		"notifications_webhook_url":     cfg.Notifications.Webhook.URL,
-		"webhook_on_critical":           cfg.Notifications.Webhook.OnCritical,
-		"webhook_on_warning":            cfg.Notifications.Webhook.OnWarning,
-		"telegram_enabled":              cfg.Notifications.Telegram.Enabled,
-		"telegram_bot_token":            cfg.Notifications.Telegram.BotToken,
-		"telegram_chat_id":              cfg.Notifications.Telegram.ChatID,
-		"telegram_on_critical":          cfg.Notifications.Telegram.OnCritical,
-		"telegram_on_warning":           cfg.Notifications.Telegram.OnWarning,
-		"feature_http_check":            cfg.Features.HTTPCheck,
-		"feature_cipher_check":          cfg.Features.CipherCheck,
-		"feature_ocsp_check":            cfg.Features.OCSPCheck,
-		"feature_crl_check":             cfg.Features.CRLCheck,
-		"feature_caa_check":             cfg.Features.CAACheck,
-		"feature_csv_export":            cfg.Features.CSVExport,
-		"feature_timeline_view":         cfg.Features.TimelineView,
-		"feature_dashboard_tag_filter":  cfg.Features.DashboardTagFilter,
-		"feature_structured_logs":       cfg.Features.StructuredLogs,
-		"domain_subdomain_fallback":     cfg.Domains.SubdomainFallback,
+		"checker_interval":                cfg.Checker.Interval,
+		"checker_timeout":                 cfg.Checker.Timeout,
+		"checker_concurrent_checks":       cfg.Checker.ConcurrentChecks,
+		"prometheus_enabled":              cfg.Prometheus.Enabled,
+		"prometheus_path":                 cfg.Prometheus.Path,
+		"alert_domain_expiry_warning":     cfg.Alerts.DomainExpiryWarningDays,
+		"alert_domain_expiry_critical":    cfg.Alerts.DomainExpiryCriticalDays,
+		"alert_ssl_expiry_warning":        cfg.Alerts.SSLExpiryWarningDays,
+		"alert_ssl_expiry_critical":       cfg.Alerts.SSLExpiryCriticalDays,
+		"notifications_enabled":           cfg.Features.Notifications,
+		"notifications_webhook_url":       cfg.Notifications.Webhook.URL,
+		"webhook_on_critical":             cfg.Notifications.Webhook.OnCritical,
+		"webhook_on_warning":              cfg.Notifications.Webhook.OnWarning,
+		"telegram_enabled":                cfg.Notifications.Telegram.Enabled,
+		"telegram_bot_token":              cfg.Notifications.Telegram.BotToken,
+		"telegram_chat_id":                cfg.Notifications.Telegram.ChatID,
+		"telegram_on_critical":            cfg.Notifications.Telegram.OnCritical,
+		"telegram_on_warning":             cfg.Notifications.Telegram.OnWarning,
+		"feature_http_check":              cfg.Features.HTTPCheck,
+		"feature_cipher_check":            cfg.Features.CipherCheck,
+		"feature_ocsp_check":              cfg.Features.OCSPCheck,
+		"feature_crl_check":               cfg.Features.CRLCheck,
+		"feature_caa_check":               cfg.Features.CAACheck,
+		"feature_csv_export":              cfg.Features.CSVExport,
+		"feature_timeline_view":           cfg.Features.TimelineView,
+		"feature_dashboard_tag_filter":    cfg.Features.DashboardTagFilter,
+		"feature_structured_logs":         cfg.Features.StructuredLogs,
+		"domain_subdomain_fallback":       cfg.Domains.SubdomainFallback,
 		"domain_subdomain_fallback_depth": cfg.Domains.FallbackDepth,
+		"domain_default_check_mode":       cfg.Domains.DefaultCheckMode,
+		"dns_servers":                     strings.Join(cfg.DNS.Servers, ","),
+		"dns_use_system_dns":              cfg.DNS.UseSystemDNS,
+		"dns_timeout":                     cfg.DNS.Timeout,
 	})
 }
 
@@ -474,7 +717,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	cfg := h.cfg.Clone()
+	cfg := h.cfg.Snapshot()
 	for k, v := range req {
 		switch k {
 		case "checker_interval":
@@ -547,6 +790,21 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			if n, err := strconv.Atoi(v); err == nil {
 				cfg.Domains.FallbackDepth = n
 			}
+		case "domain_default_check_mode":
+			cfg.Domains.DefaultCheckMode = config.ValidateCheckMode(v)
+		case "dns_servers":
+			servers := []string{}
+			for _, s := range strings.Split(v, ",") {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					servers = append(servers, s)
+				}
+			}
+			cfg.DNS.Servers = servers
+		case "dns_use_system_dns":
+			cfg.DNS.UseSystemDNS = parseBool(v)
+		case "dns_timeout":
+			cfg.DNS.Timeout = v
 		}
 	}
 
@@ -624,4 +882,116 @@ func isFolderAlreadyExistsErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint failed") && strings.Contains(msg, "folders.name")
+}
+
+func (h *Handler) refreshTotalDomainsMetric() {
+	if h.metrics == nil {
+		return
+	}
+	domains, err := h.db.GetDomains()
+	if err != nil {
+		return
+	}
+	h.metrics.SetTotalDomains(len(domains))
+}
+
+func buildImportedDomain(cfg *config.Config, current *db.Domain, in domainInput) *db.Domain {
+	out := &db.Domain{}
+	if current != nil {
+		*out = *cloneDomain(current)
+	}
+
+	if current == nil {
+		out.Name = in.Name
+		out.Enabled = true
+		out.Port = 443
+		out.CheckInterval = 21600
+		out.CheckMode = config.ValidateCheckMode(cfg.Domains.DefaultCheckMode)
+	}
+
+	if in.HasName {
+		out.Name = in.Name
+	}
+	if in.HasTags {
+		out.Tags = append([]string(nil), in.Tags...)
+	}
+	if in.HasMetadata {
+		out.Metadata = cloneMetadata(in.Metadata)
+	}
+	if in.HasCustomCAPEM {
+		out.CustomCAPEM = in.CustomCAPEM
+	}
+	if in.HasCheckMode {
+		out.CheckMode = in.CheckMode
+	}
+	if in.HasDNSServers {
+		out.DNSServers = in.DNSServers
+	}
+	if in.HasInterval && in.Interval > 0 {
+		out.CheckInterval = in.Interval
+	}
+	if in.HasPort && in.Port > 0 {
+		out.Port = in.Port
+	}
+	if in.HasFolderID {
+		out.FolderID = cloneFolderID(in.FolderID)
+	}
+	if in.HasEnabled {
+		out.Enabled = in.Enabled
+	}
+
+	out.Tags = db.NormalizeTags(out.Tags)
+	if normalized, err := db.ValidateAndNormalizeMetadata(out.Metadata); err == nil {
+		out.Metadata = normalized
+	}
+	if out.Port <= 0 {
+		out.Port = 443
+	}
+	if out.CheckInterval <= 0 {
+		out.CheckInterval = 21600
+	}
+	out.CheckMode = config.ValidateCheckMode(out.CheckMode)
+
+	return out
+}
+
+func cloneMetadata(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(src))
+	for key, value := range src {
+		out[key] = value
+	}
+	return out
+}
+
+func cloneFolderID(folderID *int64) *int64 {
+	if folderID == nil {
+		return nil
+	}
+	value := *folderID
+	return &value
+}
+
+func cloneDomain(src *db.Domain) *db.Domain {
+	if src == nil {
+		return nil
+	}
+	out := *src
+	out.Tags = append([]string(nil), src.Tags...)
+	out.Metadata = cloneMetadata(src.Metadata)
+	out.FolderID = cloneFolderID(src.FolderID)
+	return &out
+}
+
+func marshalMetadataCSV(metadata map[string]string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	buf, err := json.Marshal(metadata)
+	if err != nil {
+		return db.MetadataSearchText(metadata)
+	}
+	return string(buf)
 }

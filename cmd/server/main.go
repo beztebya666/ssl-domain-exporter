@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -13,16 +13,16 @@ import (
 	"syscall"
 	"time"
 
-	"domain-ssl-checker/internal/api"
-	"domain-ssl-checker/internal/checker"
-	"domain-ssl-checker/internal/config"
-	"domain-ssl-checker/internal/db"
-	"domain-ssl-checker/internal/metrics"
+	"ssl-domain-exporter/internal/api"
+	"ssl-domain-exporter/internal/checker"
+	"ssl-domain-exporter/internal/config"
+	"ssl-domain-exporter/internal/db"
+	"ssl-domain-exporter/internal/metrics"
 )
 
 var (
-	AppVersion = "v1.1.0"
-	UIVersion  = "v1.1.0"
+	AppVersion = "v1.2.0"
+	UIVersion  = "v1.2.0"
 	BuildTime  = "unknown"
 	GitCommit  = "unknown"
 )
@@ -83,6 +83,12 @@ func main() {
 	}
 
 	m := metrics.New()
+	if domains, err := database.GetDomains(); err == nil {
+		m.SyncDomains(domains)
+		m.SetTotalDomains(len(domains))
+	} else {
+		log.Printf("Warning: failed to preload domain metrics: %v", err)
+	}
 	notifier := checker.NewNotifier(cfg)
 	chk := checker.New(cfg, database, m, notifier)
 	sched := checker.NewScheduler(cfg, database, chk, m)

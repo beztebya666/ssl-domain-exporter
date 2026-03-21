@@ -26,7 +26,7 @@ export default function Timeline() {
     if (d.last_check?.ssl_expiry_days != null) {
       items.push({ id: d.id, name: d.name, kind: 'ssl', days: d.last_check.ssl_expiry_days })
     }
-    if (d.last_check?.domain_expiry_days != null) {
+    if (d.last_check?.domain_expiry_days != null && !d.last_check.registration_check_skipped) {
       items.push({ id: d.id, name: d.name, kind: 'domain', days: d.last_check.domain_expiry_days })
     }
   }

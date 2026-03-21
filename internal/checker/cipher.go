@@ -1,4 +1,4 @@
-﻿package checker
+package checker
 
 import (
 	"crypto/tls"
@@ -18,9 +18,23 @@ type CipherResult struct {
 	Error            string
 }
 
-func CheckCipherSuite(domain string, port int, timeout time.Duration) *CipherResult {
+func CheckCipherSuite(domain string, port int, timeout time.Duration, rc *ResolveContext) *CipherResult {
 	result := &CipherResult{Grade: "N/A"}
 	host, serverName := tlsHost(domain, port)
+
+	// Resolve via custom DNS if needed
+	dialAddr := host
+	if rc != nil && len(rc.Servers) > 0 {
+		h, p := splitHostPort(host)
+		if ip := net.ParseIP(h); ip == nil {
+			resolved, err := rc.ResolveHost(h)
+			if err != nil {
+				result.Error = fmt.Sprintf("DNS resolve failed: %v", err)
+				return result
+			}
+			dialAddr = net.JoinHostPort(resolved, p)
+		}
+	}
 
 	supported := make(map[uint16]bool)
 	versions := []struct {
@@ -34,7 +48,7 @@ func CheckCipherSuite(domain string, port int, timeout time.Duration) *CipherRes
 	}
 
 	for _, v := range versions {
-		state, err := tlsProbe(host, serverName, timeout, v.version, v.version, nil)
+		state, err := tlsProbe(dialAddr, serverName, timeout, v.version, v.version, nil)
 		if err != nil {
 			continue
 		}
@@ -62,7 +76,7 @@ func CheckCipherSuite(domain string, port int, timeout time.Duration) *CipherRes
 	}
 
 	for _, s := range weakSuites {
-		_, err := tlsProbe(host, serverName, timeout, tls.VersionTLS10, tls.VersionTLS12, []uint16{s.id})
+		_, err := tlsProbe(dialAddr, serverName, timeout, tls.VersionTLS10, tls.VersionTLS12, []uint16{s.id})
 		if err == nil {
 			result.WeakCiphers = append(result.WeakCiphers, s.label)
 		}

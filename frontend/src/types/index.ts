@@ -56,6 +56,10 @@ export interface Check {
   caa_query_domain: string
   caa_error: string
 
+  registration_check_skipped: boolean
+  registration_skip_reason: string
+  dns_server_used: string
+
   overall_status: 'ok' | 'warning' | 'critical' | 'error' | 'unknown'
   check_duration_ms: number
 }
@@ -66,13 +70,61 @@ export interface Domain {
   port: number
   enabled: boolean
   check_interval: number
-  tags: string
+  tags: string[]
+  metadata: Record<string, string>
   folder_id?: number | null
   sort_order: number
   custom_ca_pem: string
+  check_mode: string
+  dns_servers: string
   created_at: string
   updated_at: string
   last_check?: Check
+}
+
+export interface DomainWritePayload {
+  name?: string
+  domain?: string
+  tags?: string[] | string | null
+  metadata?: Record<string, string> | null
+  enabled?: boolean
+  check_interval?: number
+  custom_ca_pem?: string
+  port?: number
+  folder_id?: number | null
+  check_mode?: string
+  dns_servers?: string
+}
+
+export interface DomainImportSummary {
+  total: number
+  created: number
+  updated: number
+  skipped: number
+  failed: number
+}
+
+export interface DomainImportResult {
+  index: number
+  name?: string
+  action: string
+  error?: string
+  domain?: Domain
+}
+
+export interface DomainImportResponse {
+  mode: string
+  dry_run: boolean
+  summary: DomainImportSummary
+  results: DomainImportResult[]
+}
+
+export interface DomainImportRequest {
+  mode?: 'create_only' | 'upsert'
+  dry_run?: boolean
+  trigger_checks?: boolean
+  defaults?: Record<string, unknown>
+  domains: Array<Record<string, unknown>>
 }
 
 export interface Folder {
@@ -149,9 +201,15 @@ export interface AppConfig {
       on_warning: boolean
     }
   }
+  dns: {
+    servers: string[]
+    use_system_dns: boolean
+    timeout: string
+  }
   domains: {
     subdomain_fallback: boolean
     fallback_depth: number
+    default_check_mode: string
   }
   prometheus: {
     enabled: boolean

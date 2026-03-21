@@ -1,4 +1,4 @@
-﻿package api
+package api
 
 import (
 	"crypto/subtle"
@@ -7,12 +7,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"domain-ssl-checker/internal/config"
+	"ssl-domain-exporter/internal/config"
 )
 
 func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if !cfg.Auth.Enabled {
+		// Take a thread-safe snapshot so hot-reloaded config is read safely.
+		snap := cfg.Snapshot()
+
+		if !snap.Auth.Enabled {
 			c.Next()
 			return
 		}
@@ -20,29 +23,29 @@ func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if !shouldProtectPath(cfg, c.Request.URL.Path) {
+		if !shouldProtectPath(snap, c.Request.URL.Path) {
 			c.Next()
 			return
 		}
 
-		mode := strings.ToLower(strings.TrimSpace(cfg.Auth.Mode))
+		mode := strings.ToLower(strings.TrimSpace(snap.Auth.Mode))
 		switch mode {
 		case "api_key":
-			if validateAPIKey(cfg, c) {
+			if validateAPIKey(snap, c) {
 				c.Next()
 				return
 			}
 			unauthorized(c)
 			return
 		case "both":
-			if validateBasic(cfg, c) || validateAPIKey(cfg, c) {
+			if validateBasic(snap, c) || validateAPIKey(snap, c) {
 				c.Next()
 				return
 			}
 			unauthorized(c)
 			return
 		default:
-			if validateBasic(cfg, c) {
+			if validateBasic(snap, c) {
 				c.Next()
 				return
 			}

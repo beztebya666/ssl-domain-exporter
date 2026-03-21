@@ -18,7 +18,7 @@ type HTTPResult struct {
 	Error          string
 }
 
-func CheckHTTP(domain string, port int, timeout time.Duration, customCAPEM string) *HTTPResult {
+func CheckHTTP(domain string, port int, timeout time.Duration, customCAPEM string, rc *ResolveContext) *HTTPResult {
 	result := &HTTPResult{}
 
 	roots, rootsErr := loadRootPool(customCAPEM)
@@ -28,6 +28,11 @@ func CheckHTTP(domain string, port int, timeout time.Duration, customCAPEM strin
 
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: roots},
+	}
+
+	// Use custom DNS resolver for HTTP connections if available
+	if rc != nil && len(rc.Servers) > 0 {
+		transport.DialContext = rc.CustomDialer(timeout)
 	}
 
 	client := &http.Client{

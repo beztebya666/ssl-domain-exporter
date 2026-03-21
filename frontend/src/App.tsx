@@ -175,9 +175,9 @@ export default function App() {
           <div className="p-5 border-b border-slate-700/60">
             <div className="flex items-center gap-2">
               <Activity size={22} className="text-blue-400" />
-              <span className="font-bold text-white">SSL Monitor</span>
+              <span className="font-bold text-white">SSL Domain Exporter</span>
             </div>
-            <p className="text-xs text-gray-500 mt-1">Domain & Certificate Checker</p>
+            <p className="text-xs text-gray-500 mt-1">Certificate, Domain & Validation Checks</p>
           </div>
 
           <nav className="flex-1 p-3 space-y-1">

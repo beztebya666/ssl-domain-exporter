@@ -1,4 +1,4 @@
-﻿package config
+package config
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -78,8 +79,15 @@ type NotificationsConfig struct {
 }
 
 type DomainsConfig struct {
-	SubdomainFallback bool `yaml:"subdomain_fallback" json:"subdomain_fallback"`
-	FallbackDepth     int  `yaml:"fallback_depth" json:"fallback_depth"`
+	SubdomainFallback bool   `yaml:"subdomain_fallback" json:"subdomain_fallback"`
+	FallbackDepth     int    `yaml:"fallback_depth" json:"fallback_depth"`
+	DefaultCheckMode  string `yaml:"default_check_mode" json:"default_check_mode"` // "full" or "ssl_only"
+}
+
+type DNSConfig struct {
+	Servers      []string `yaml:"servers" json:"servers"`               // custom DNS servers, e.g. ["10.0.0.1:53"]
+	UseSystemDNS bool     `yaml:"use_system_dns" json:"use_system_dns"` // allow OS DNS discovery and OS resolver fallback
+	Timeout      string   `yaml:"timeout" json:"timeout"`               // DNS query timeout, e.g. "5s"
 }
 
 type PrometheusConfig struct {
@@ -100,10 +108,12 @@ type Config struct {
 	Alerts        AlertsConfig        `yaml:"alerts" json:"alerts"`
 	Notifications NotificationsConfig `yaml:"notifications" json:"notifications"`
 	Domains       DomainsConfig       `yaml:"domains" json:"domains"`
+	DNS           DNSConfig           `yaml:"dns" json:"dns"`
 	Prometheus    PrometheusConfig    `yaml:"prometheus" json:"prometheus"`
 	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
 
-	filePath string `yaml:"-" json:"-"`
+	mu       sync.RWMutex `yaml:"-" json:"-"`
+	filePath string       `yaml:"-" json:"-"`
 }
 
 func Default() *Config {
@@ -135,6 +145,11 @@ func Default() *Config {
 
 	cfg.Domains.SubdomainFallback = true
 	cfg.Domains.FallbackDepth = 5
+	cfg.Domains.DefaultCheckMode = "full"
+
+	cfg.DNS.Servers = []string{}
+	cfg.DNS.UseSystemDNS = true
+	cfg.DNS.Timeout = "5s"
 
 	cfg.Prometheus.Enabled = true
 	cfg.Prometheus.Path = "/metrics"
@@ -227,43 +242,101 @@ func (c *Config) normalize() {
 	if c.Domains.FallbackDepth <= 0 {
 		c.Domains.FallbackDepth = 5
 	}
+
+	cm := strings.ToLower(strings.TrimSpace(c.Domains.DefaultCheckMode))
+	if cm != "full" && cm != "ssl_only" {
+		cm = "full"
+	}
+	c.Domains.DefaultCheckMode = cm
+
+	if c.DNS.Servers == nil {
+		c.DNS.Servers = []string{}
+	}
+	if c.DNS.Timeout == "" {
+		c.DNS.Timeout = "5s"
+	}
+
 	if c.Prometheus.Path == "" {
 		c.Prometheus.Path = "/metrics"
 	}
 }
 
 func (c *Config) Save() error {
-	if c.filePath == "" {
+	path := c.FilePath()
+	if path == "" {
 		return fmt.Errorf("no config file path set")
 	}
-	if err := os.MkdirAll(filepath.Dir(c.filePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	c.normalize()
-	data, err := yaml.Marshal(c)
+	// Take a consistent snapshot under read lock, then marshal outside the lock.
+	snap := c.Snapshot()
+	snap.normalize()
+	data, err := yaml.Marshal(snap)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.filePath, data, 0o644)
+	return os.WriteFile(path, data, 0o644)
 }
 
-func (c *Config) FilePath() string { return c.filePath }
+func (c *Config) FilePath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.filePath
+}
 
-func (c *Config) SetFilePath(path string) { c.filePath = path }
+func (c *Config) SetFilePath(path string) {
+	c.mu.Lock()
+	c.filePath = path
+	c.mu.Unlock()
+}
 
+// Snapshot returns a read-only deep copy of the config, safe to use without locks.
+func (c *Config) Snapshot() *Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cloneInternal()
+}
+
+// Clone returns a deep copy (public, no locking - use when you already hold the lock or own the value).
 func (c *Config) Clone() *Config {
+	return c.cloneInternal()
+}
+
+func (c *Config) cloneInternal() *Config {
 	clone := *c
+	clone.mu = sync.RWMutex{}
+	// Deep copy slices
+	if c.DNS.Servers != nil {
+		clone.DNS.Servers = make([]string, len(c.DNS.Servers))
+		copy(clone.DNS.Servers, c.DNS.Servers)
+	}
 	return &clone
 }
 
+// ApplyFrom replaces the config contents under write lock.
 func (c *Config) ApplyFrom(in *Config) {
 	if in == nil {
 		return
 	}
+	next := in.Snapshot()
+
+	c.mu.Lock()
 	filePath := c.filePath
-	*c = *in
-	c.filePath = filePath
+	c.Server = next.Server
+	c.Database = next.Database
+	c.Auth = next.Auth
+	c.Checker = next.Checker
+	c.Features = next.Features
+	c.Alerts = next.Alerts
+	c.Notifications = next.Notifications
+	c.Domains = next.Domains
+	c.DNS = next.DNS
+	c.Prometheus = next.Prometheus
+	c.Logging = next.Logging
 	c.normalize()
+	c.filePath = filePath
+	c.mu.Unlock()
 }
 
 func applyEnvOverrides(cfg *Config) {
@@ -381,6 +454,29 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Domains.FallbackDepth = n
 		}
 	}
+	if v := os.Getenv("DEFAULT_CHECK_MODE"); v != "" {
+		cfg.Domains.DefaultCheckMode = v
+	}
+
+	// DNS env overrides
+	if v := os.Getenv("DNS_SERVERS"); v != "" {
+		servers := []string{}
+		for _, s := range strings.Split(v, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				servers = append(servers, s)
+			}
+		}
+		if len(servers) > 0 {
+			cfg.DNS.Servers = servers
+		}
+	}
+	if v := os.Getenv("DNS_USE_SYSTEM_DNS"); v != "" {
+		cfg.DNS.UseSystemDNS = parseBool(v)
+	}
+	if v := os.Getenv("DNS_TIMEOUT"); v != "" {
+		cfg.DNS.Timeout = v
+	}
 
 	if v := os.Getenv("PROMETHEUS_ENABLED"); v != "" {
 		cfg.Prometheus.Enabled = parseBool(v)
@@ -396,4 +492,13 @@ func applyEnvOverrides(cfg *Config) {
 func parseBool(v string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+// ValidateCheckMode normalizes and validates a check mode string.
+func ValidateCheckMode(mode string) string {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m == "ssl_only" {
+		return "ssl_only"
+	}
+	return "full"
 }

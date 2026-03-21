@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"domain-ssl-checker/internal/config"
-	"domain-ssl-checker/internal/db"
-	"domain-ssl-checker/internal/metrics"
+	"ssl-domain-exporter/internal/config"
+	"ssl-domain-exporter/internal/db"
+	"ssl-domain-exporter/internal/metrics"
 )
 
 type Scheduler struct {

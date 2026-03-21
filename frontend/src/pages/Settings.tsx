@@ -19,10 +19,13 @@ function Section({ title, icon: Icon, children }: {
   )
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+function Field({ label, hint, restart, children }: { label: string; hint?: string; restart?: boolean; children: React.ReactNode }) {
   return (
     <div>
-      <label className="label">{label}</label>
+      <label className="label">
+        {label}
+        {restart && <span className="ml-1.5 text-[10px] font-medium text-amber-500 border border-amber-500/30 rounded px-1 py-0.5 align-middle">restart</span>}
+      </label>
       {children}
       {hint && <p className="text-xs text-gray-600 mt-1">{hint}</p>}
     </div>
@@ -69,7 +72,7 @@ export default function SettingsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold text-white">Settings</h1>
-          <p className="text-sm text-gray-400 mt-0.5">All options persist to config.yaml immediately.</p>
+          <p className="text-sm text-gray-400 mt-0.5">Changes persist to config.yaml immediately. Fields marked <span className="text-amber-500 text-xs font-medium">restart</span> require a service restart to take effect.</p>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
             <span className="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-slate-300">UI {UI_VERSION}</span>
             <span className="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-slate-400">Build {UI_BUILD_ID}</span>
@@ -83,7 +86,7 @@ export default function SettingsPage() {
 
       <Section title="Checker" icon={Clock}>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <Field label="Database path" hint="SQLite file path">
+          <Field label="Database path" hint="SQLite file path" restart>
             <input className="input" value={form.database.path}
               onChange={e => setForm(f => f ? ({ ...f, database: { ...f.database, path: e.target.value } }) : f)} />
           </Field>
@@ -95,7 +98,7 @@ export default function SettingsPage() {
             <input className="input" value={form.checker.timeout}
               onChange={e => setForm(f => f ? ({ ...f, checker: { ...f.checker, timeout: e.target.value } }) : f)} />
           </Field>
-          <Field label="Concurrent checks">
+          <Field label="Concurrent checks" restart>
             <input className="input" type="number" min={1} max={50} value={form.checker.concurrent_checks}
               onChange={e => setForm(f => f ? ({ ...f, checker: { ...f.checker, concurrent_checks: Number(e.target.value) } }) : f)} />
           </Field>
@@ -122,7 +125,7 @@ export default function SettingsPage() {
             onChange={v => setForm(f => f ? ({ ...f, features: { ...f.features, timeline_view: v } }) : f)} /></Field>
           <Field label="Dashboard tag filter"><BoolSelect value={form.features.dashboard_tag_filter}
             onChange={v => setForm(f => f ? ({ ...f, features: { ...f.features, dashboard_tag_filter: v } }) : f)} /></Field>
-          <Field label="Structured JSON logs"><BoolSelect value={form.features.structured_logs}
+          <Field label="Structured JSON logs" restart><BoolSelect value={form.features.structured_logs}
             onChange={v => setForm(f => f ? ({ ...f, features: { ...f.features, structured_logs: v } }) : f)} /></Field>
         </div>
       </Section>
@@ -211,8 +214,32 @@ export default function SettingsPage() {
         </div>
       </Section>
 
+      <Section title="DNS Resolution" icon={Globe}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="Global DNS servers" hint="Comma-separated, e.g. 10.0.0.1:53, 10.0.0.2:53">
+            <input className="input" value={(form.dns?.servers ?? []).join(', ')}
+              onChange={e => setForm(f => f ? ({ ...f, dns: { ...f.dns, servers: e.target.value.split(',').map(s => s.trim()).filter(Boolean) } }) : f)} />
+          </Field>
+          <Field label="Use system DNS" hint="Fall back to OS-configured resolvers">
+            <BoolSelect value={form.dns?.use_system_dns ?? false}
+              onChange={v => setForm(f => f ? ({ ...f, dns: { ...f.dns, use_system_dns: v } }) : f)} />
+          </Field>
+          <Field label="DNS timeout" hint="e.g. 5s, 10s">
+            <input className="input" value={form.dns?.timeout ?? '5s'}
+              onChange={e => setForm(f => f ? ({ ...f, dns: { ...f.dns, timeout: e.target.value } }) : f)} />
+          </Field>
+        </div>
+      </Section>
+
       <Section title="Domain Lookup" icon={Globe}>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="Default check mode" hint="Applied to new domains when no mode is specified">
+            <select className="input" value={form.domains.default_check_mode ?? 'full'}
+              onChange={e => setForm(f => f ? ({ ...f, domains: { ...f.domains, default_check_mode: e.target.value } }) : f)}>
+              <option value="full">Full (SSL + Domain Registration)</option>
+              <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
+            </select>
+          </Field>
           <Field label="Subdomain fallback"><BoolSelect value={form.domains.subdomain_fallback}
             onChange={v => setForm(f => f ? ({ ...f, domains: { ...f.domains, subdomain_fallback: v } }) : f)} /></Field>
           <Field label="Fallback depth" hint="How many parent levels to try">
@@ -224,13 +251,13 @@ export default function SettingsPage() {
 
       <Section title="Prometheus & Logging" icon={Activity}>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <Field label="Prometheus enabled"><BoolSelect value={form.prometheus.enabled}
+          <Field label="Prometheus enabled" restart><BoolSelect value={form.prometheus.enabled}
             onChange={v => setForm(f => f ? ({ ...f, prometheus: { ...f.prometheus, enabled: v } }) : f)} /></Field>
-          <Field label="Prometheus path">
+          <Field label="Prometheus path" restart>
             <input className="input" value={form.prometheus.path}
               onChange={e => setForm(f => f ? ({ ...f, prometheus: { ...f.prometheus, path: e.target.value } }) : f)} />
           </Field>
-          <Field label="JSON logs"><BoolSelect value={form.logging.json}
+          <Field label="JSON logs" restart><BoolSelect value={form.logging.json}
             onChange={v => setForm(f => f ? ({ ...f, logging: { ...f.logging, json: v } }) : f)} /></Field>
         </div>
       </Section>

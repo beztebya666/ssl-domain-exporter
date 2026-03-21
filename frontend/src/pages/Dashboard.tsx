@@ -33,12 +33,12 @@ export default function Dashboard() {
 
   const allTags = Array.from(new Set(
     domains
-      .flatMap(d => d.tags.split(',').map(t => t.trim()).filter(Boolean))
+      .flatMap(d => d.tags)
   )).sort((a, b) => a.localeCompare(b))
 
   const filteredDomains = selectedTag === 'all'
     ? domains
-    : domains.filter(d => d.tags.split(',').map(t => t.trim()).includes(selectedTag))
+    : domains.filter(d => d.tags.includes(selectedTag))
 
   const criticalDomains = filteredDomains.filter(d => d.last_check?.overall_status === 'critical')
   const warningDomains = filteredDomains.filter(d => d.last_check?.overall_status === 'warning')
@@ -106,7 +106,7 @@ export default function Dashboard() {
                 {d.last_check?.ssl_expiry_days != null && (
                   <span>SSL: {d.last_check.ssl_expiry_days}d</span>
                 )}
-                {d.last_check?.domain_expiry_days != null && (
+                {d.last_check && !d.last_check.registration_check_skipped && d.last_check.domain_expiry_days != null && (
                   <span className="ml-3">Domain: {d.last_check.domain_expiry_days}d</span>
                 )}
               </div>
@@ -192,7 +192,9 @@ export default function Dashboard() {
                       ) : <span className="text-gray-600">-</span>}
                     </td>
                     <td className="py-3">
-                      {d.last_check?.domain_expiry_days != null ? (
+                      {d.last_check?.registration_check_skipped ? (
+                        <span className="text-gray-600">N/A</span>
+                      ) : d.last_check?.domain_expiry_days != null ? (
                         <span className={
                           d.last_check.domain_expiry_days <= 7 ? 'text-red-400' :
                           d.last_check.domain_expiry_days <= 30 ? 'text-yellow-400' : 'text-green-400'

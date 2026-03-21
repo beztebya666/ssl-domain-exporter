@@ -1,12 +1,18 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
-import { X, Plus, Upload, FolderPlus } from 'lucide-react'
-import { createDomain, fetchFolders, createFolder } from '../api/client'
+import { X, Plus, Upload, FolderPlus, FileJson, ListChecks } from 'lucide-react'
+import { createDomain, fetchFolders, createFolder, fetchConfig, importDomains } from '../api/client'
+import type { DomainImportRequest, DomainImportResponse } from '../types'
+import TagEditor from './TagEditor'
+import MetadataEditor from './MetadataEditor'
+import { normalizeMetadata } from '../lib/domainFields'
 
 interface Props {
   onClose: () => void
 }
+
+type Mode = 'single' | 'lines' | 'json'
 
 const INTERVALS = [
   { label: '1 hour', value: 3600 },
@@ -17,25 +23,46 @@ const INTERVALS = [
 ]
 
 export default function AddDomainModal({ onClose }: Props) {
+  const [mode, setMode] = useState<Mode>('single')
   const [name, setName] = useState('')
-  const [tags, setTags] = useState('')
+  const [tags, setTags] = useState<string[]>([])
+  const [metadata, setMetadata] = useState<Record<string, string>>({})
+  const [enabled, setEnabled] = useState(true)
   const [interval, setInterval] = useState(21600)
   const [port, setPort] = useState(443)
   const [folderValue, setFolderValue] = useState<string>('')
-  const [bulkMode, setBulkMode] = useState(false)
   const [bulkText, setBulkText] = useState('')
+  const [jsonText, setJsonText] = useState('')
   const [customCAPEM, setCustomCAPEM] = useState('')
+  const [checkMode, setCheckMode] = useState('')
+  const [dnsServers, setDnsServers] = useState('')
   const [submitError, setSubmitError] = useState('')
   const [newFolderName, setNewFolderName] = useState('')
+  const [importMode, setImportMode] = useState<'create_only' | 'upsert'>('create_only')
+  const [dryRun, setDryRun] = useState(false)
+  const [triggerChecks, setTriggerChecks] = useState(false)
+  const [lastImport, setLastImport] = useState<DomainImportResponse | null>(null)
 
   const qc = useQueryClient()
   const { data: folders = [] } = useQuery({ queryKey: ['folders'], queryFn: fetchFolders })
+  const { data: cfg } = useQuery({ queryKey: ['config'], queryFn: fetchConfig })
 
   const mutation = useMutation({
     mutationFn: createDomain,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['domains'] })
       qc.invalidateQueries({ queryKey: ['summary'] })
+    },
+  })
+
+  const importMutation = useMutation({
+    mutationFn: importDomains,
+    onSuccess: (result) => {
+      setLastImport(result)
+      if (!result.dry_run) {
+        qc.invalidateQueries({ queryKey: ['domains'] })
+        qc.invalidateQueries({ queryKey: ['summary'] })
+      }
     },
   })
 
@@ -49,20 +76,37 @@ export default function AddDomainModal({ onClose }: Props) {
   })
 
   const selectedFolderID = folderValue ? Number(folderValue) : undefined
+  const effectiveMode = checkMode || cfg?.domains.default_check_mode || 'full'
+  const importDefaults = useMemo(() => buildImportDefaults({
+    tags,
+    metadata,
+    enabled,
+    interval,
+    port,
+    folderID: selectedFolderID,
+    customCAPEM,
+    checkMode: effectiveMode,
+    dnsServers,
+  }), [tags, metadata, enabled, interval, port, selectedFolderID, customCAPEM, effectiveMode, dnsServers])
 
   const handleSingle = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!name.trim()) return
     setSubmitError('')
+    setLastImport(null)
 
     try {
       await mutation.mutateAsync({
         name: name.trim(),
         tags,
+        metadata: normalizeMetadata(metadata),
+        enabled,
         check_interval: interval,
         port,
         folder_id: selectedFolderID,
         custom_ca_pem: customCAPEM.trim() || undefined,
+        check_mode: effectiveMode,
+        dns_servers: dnsServers.trim() || undefined,
       })
       onClose()
     } catch (err) {
@@ -70,27 +114,60 @@ export default function AddDomainModal({ onClose }: Props) {
     }
   }
 
-  const handleBulk = async (e: React.FormEvent) => {
+  const handleLinesImport = async (e: React.FormEvent) => {
     e.preventDefault()
     setSubmitError('')
+    setLastImport(null)
 
     const domains = bulkText
       .split('\n')
-      .map(l => l.trim())
-      .filter(l => l.length > 0 && !l.startsWith('#'))
+      .map(line => line.trim())
+      .filter(line => line.length > 0 && !line.startsWith('#'))
+      .map(line => ({ name: line }))
+
+    if (domains.length === 0) {
+      setSubmitError('Add at least one domain to import.')
+      return
+    }
 
     try {
-      for (const d of domains) {
-        await mutation.mutateAsync({
-          name: d,
-          tags,
-          check_interval: interval,
-          port,
-          folder_id: selectedFolderID,
-          custom_ca_pem: customCAPEM.trim() || undefined,
-        })
+      const result = await importMutation.mutateAsync({
+        mode: importMode,
+        dry_run: dryRun,
+        trigger_checks: triggerChecks,
+        defaults: importDefaults,
+        domains,
+      })
+      if (!result.dry_run && result.summary.failed === 0 && result.summary.skipped === 0) {
+        onClose()
       }
-      onClose()
+    } catch (err) {
+      setSubmitError(extractErrorMessage(err))
+    }
+  }
+
+  const handleJSONImport = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setSubmitError('')
+    setLastImport(null)
+
+    try {
+      const payload = parseJSONImportText(jsonText)
+      const finalPayload: DomainImportRequest = {
+        mode: payload.mode ?? importMode,
+        dry_run: payload.dry_run ?? dryRun,
+        trigger_checks: payload.trigger_checks ?? triggerChecks,
+        defaults: {
+          ...importDefaults,
+          ...(payload.defaults ?? {}),
+        },
+        domains: payload.domains,
+      }
+
+      const result = await importMutation.mutateAsync(finalPayload)
+      if (!result.dry_run && result.summary.failed === 0 && result.summary.skipped === 0) {
+        onClose()
+      }
     } catch (err) {
       setSubmitError(extractErrorMessage(err))
     }
@@ -107,55 +184,72 @@ export default function AddDomainModal({ onClose }: Props) {
   }
 
   const handleCreateFolder = async () => {
-    const name = newFolderName.trim()
-    if (!name) return
+    const trimmed = newFolderName.trim()
+    if (!trimmed) return
     setSubmitError('')
     try {
-      await folderMutation.mutateAsync(name)
+      await folderMutation.mutateAsync(trimmed)
     } catch (err) {
       setSubmitError(extractErrorMessage(err))
     }
   }
 
+  const isImportMode = mode !== 'single'
+  const isBusy = mutation.isPending || importMutation.isPending
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onClose])
+
   return (
-    <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50 p-4">
-      <div className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-3xl shadow-2xl">
-        <div className="flex items-center justify-between p-5 border-b border-gray-800">
-          <h2 className="font-semibold text-white">Add Domain(s)</h2>
-          <button onClick={onClose} className="btn-ghost p-1.5 rounded-lg">
+    <div
+      className="fixed inset-0 z-50 overflow-y-auto bg-black/75 p-4 md:flex md:items-center md:justify-center"
+      onClick={onClose}
+    >
+      <div
+        className="my-4 flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-gray-700 bg-gray-900 shadow-2xl"
+        onClick={event => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-gray-800 p-5">
+          <h2 className="font-semibold text-white">Add Domains</h2>
+          <button onClick={onClose} className="btn-ghost rounded-lg p-1.5">
             <X size={16} />
           </button>
         </div>
 
-        <div className="p-5">
-          <div className="flex gap-2 mb-5">
+        <div className="overflow-y-auto p-5">
+          <div className="mb-5 grid grid-cols-1 gap-2 md:grid-cols-3">
             <button
-              className={`btn text-xs flex-1 ${!bulkMode ? 'btn-primary' : 'btn-ghost border border-gray-700'}`}
-              onClick={() => setBulkMode(false)}
+              className={`btn text-xs ${mode === 'single' ? 'btn-primary' : 'btn-ghost border border-gray-700'}`}
+              onClick={() => setMode('single')}
             >
               Single domain
             </button>
             <button
-              className={`btn text-xs flex-1 ${bulkMode ? 'btn-primary' : 'btn-ghost border border-gray-700'}`}
-              onClick={() => setBulkMode(true)}
+              className={`btn text-xs ${mode === 'lines' ? 'btn-primary' : 'btn-ghost border border-gray-700'}`}
+              onClick={() => setMode('lines')}
             >
-              Bulk import
+              <ListChecks size={14} />
+              Line import
+            </button>
+            <button
+              className={`btn text-xs ${mode === 'json' ? 'btn-primary' : 'btn-ghost border border-gray-700'}`}
+              onClick={() => setMode('json')}
+            >
+              <FileJson size={14} />
+              JSON import
             </button>
           </div>
 
-          <form onSubmit={bulkMode ? handleBulk : handleSingle} className="space-y-4">
-            {bulkMode ? (
-              <div>
-                <label className="label">Domains (one per line)</label>
-                <textarea
-                  className="input h-28 resize-none font-mono"
-                  placeholder="example.com&#10;another.org&#10;# comments are ignored"
-                  value={bulkText}
-                  onChange={e => setBulkText(e.target.value)}
-                  required
-                />
-              </div>
-            ) : (
+          <form onSubmit={mode === 'single' ? handleSingle : mode === 'lines' ? handleLinesImport : handleJSONImport} className="space-y-5">
+            {mode === 'single' && (
               <div>
                 <label className="label">Domain name</label>
                 <input
@@ -165,30 +259,56 @@ export default function AddDomainModal({ onClose }: Props) {
                   onChange={e => setName(e.target.value)}
                   required
                 />
-                <p className="text-xs text-gray-500 mt-1">`https://` or path parts are removed automatically.</p>
+                <p className="mt-1 text-xs text-gray-500">`https://` or path parts are removed automatically.</p>
               </div>
             )}
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {mode === 'lines' && (
               <div>
-                <label className="label">Tags (optional)</label>
-                <input
-                  className="input"
-                  placeholder="production, web, api"
-                  value={tags}
-                  onChange={e => setTags(e.target.value)}
+                <label className="label">Domains (one per line)</label>
+                <textarea
+                  className="input h-36 resize-y font-mono"
+                  placeholder="example.com&#10;another.org&#10;# comments are ignored"
+                  value={bulkText}
+                  onChange={e => setBulkText(e.target.value)}
+                  required
                 />
+                <p className="mt-1 text-xs text-gray-500">Shared defaults below apply to every imported domain.</p>
+              </div>
+            )}
+
+            {mode === 'json' && (
+              <div>
+                <label className="label">JSON payload</label>
+                <textarea
+                  className="input h-64 resize-y font-mono text-xs"
+                  placeholder={JSON_PLACEHOLDER}
+                  value={jsonText}
+                  onChange={e => setJsonText(e.target.value)}
+                  required
+                />
+                <p className="mt-1 text-xs text-gray-500">Supports top-level objects with a `domains` array or a plain array. Unknown item fields are stored in metadata automatically.</p>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div>
+                <label className="label">Tags</label>
+                <TagEditor tags={tags} onChange={setTags} placeholder="production api owner-team" />
               </div>
 
               <div>
+                <label className="label">Metadata</label>
+                <MetadataEditor value={metadata} onChange={setMetadata} />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <div>
                 <label className="label">Check interval</label>
-                <select
-                  className="input"
-                  value={interval}
-                  onChange={e => setInterval(Number(e.target.value))}
-                >
-                  {INTERVALS.map(i => (
-                    <option key={i.value} value={i.value}>{i.label}</option>
+                <select className="input" value={interval} onChange={e => setInterval(Number(e.target.value))}>
+                  {INTERVALS.map(item => (
+                    <option key={item.value} value={item.value}>{item.label}</option>
                   ))}
                 </select>
               </div>
@@ -206,6 +326,14 @@ export default function AddDomainModal({ onClose }: Props) {
               </div>
 
               <div>
+                <label className="label">Enabled</label>
+                <select className="input" value={enabled ? 'true' : 'false'} onChange={e => setEnabled(e.target.value === 'true')}>
+                  <option value="true">Enabled</option>
+                  <option value="false">Disabled</option>
+                </select>
+              </div>
+
+              <div>
                 <label className="label">Folder</label>
                 <select className="input" value={folderValue} onChange={e => setFolderValue(e.target.value)}>
                   <option value="">No folder</option>
@@ -214,11 +342,57 @@ export default function AddDomainModal({ onClose }: Props) {
                   ))}
                 </select>
               </div>
+
+              <div>
+                <label className="label">Check mode</label>
+                <select className="input" value={checkMode} onChange={e => setCheckMode(e.target.value)}>
+                  <option value="">Default ({cfg?.domains.default_check_mode || 'full'})</option>
+                  <option value="full">Full (SSL + Domain Registration)</option>
+                  <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
+                </select>
+                <p className="mt-1 text-xs text-gray-500">SSL Only skips domain registration lookup for internal names such as `.local` or `.internal`.</p>
+              </div>
+
+              <div>
+                <label className="label">DNS Servers</label>
+                <input
+                  className="input"
+                  placeholder="10.0.0.1:53, 10.0.0.2:53"
+                  value={dnsServers}
+                  onChange={e => setDnsServers(e.target.value)}
+                />
+                <p className="mt-1 text-xs text-gray-500">Per-domain DNS servers. Overrides global DNS config.</p>
+              </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-2 items-end">
+            {isImportMode && (
+              <>
+                <div className="grid grid-cols-1 gap-4 rounded-xl border border-gray-800 bg-gray-950/40 p-4 md:grid-cols-3">
+                  <div>
+                    <label className="label">Import mode</label>
+                    <select className="input" value={importMode} onChange={e => setImportMode(e.target.value as 'create_only' | 'upsert')}>
+                      <option value="create_only">Create only</option>
+                      <option value="upsert">Upsert existing domains</option>
+                    </select>
+                  </div>
+                  <label className="flex items-center gap-2 rounded-lg border border-gray-800 px-3 py-2 text-sm text-gray-300">
+                    <input type="checkbox" checked={dryRun} onChange={e => setDryRun(e.target.checked)} />
+                    Dry run only
+                  </label>
+                  <label className="flex items-center gap-2 rounded-lg border border-gray-800 px-3 py-2 text-sm text-gray-300">
+                    <input type="checkbox" checked={triggerChecks} onChange={e => setTriggerChecks(e.target.checked)} />
+                    Trigger checks after import
+                  </label>
+                </div>
+                <div className="text-xs text-gray-500">
+                  Shared defaults in this form apply to every imported record. In `upsert` mode, provided defaults can overwrite existing domain settings.
+                </div>
+              </>
+            )}
+
+            <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[1fr_auto]">
               <div>
-                <label className="label">Create folder (optional)</label>
+                <label className="label">Create folder</label>
                 <input
                   className="input"
                   placeholder="backend, public-sites, staging"
@@ -233,9 +407,9 @@ export default function AddDomainModal({ onClose }: Props) {
             </div>
 
             <div>
-              <div className="flex items-center justify-between mb-1.5">
+              <div className="mb-1.5 flex items-center justify-between">
                 <label className="label mb-0">Custom Root CA (optional)</label>
-                <label className="btn-ghost border border-gray-700 px-2 py-1 text-xs cursor-pointer inline-flex items-center gap-1.5">
+                <label className="inline-flex cursor-pointer items-center gap-1.5 border border-gray-700 px-2 py-1 text-xs btn-ghost">
                   <Upload size={12} />
                   Load .crt/.pem
                   <input
@@ -252,12 +426,40 @@ export default function AddDomainModal({ onClose }: Props) {
                 value={customCAPEM}
                 onChange={e => setCustomCAPEM(e.target.value)}
               />
-              <p className="text-xs text-gray-500 mt-1">Used as additional trust root for SSL/HTTPS checks for this domain.</p>
+              <p className="mt-1 text-xs text-gray-500">Used as an additional trust root for SSL and HTTPS checks for this domain.</p>
             </div>
 
             {submitError && (
-              <div className="text-xs text-amber-300 bg-amber-500/10 border border-amber-600/20 rounded-lg px-3 py-2">
+              <div className="rounded-lg border border-amber-600/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
                 {submitError}
+              </div>
+            )}
+
+            {lastImport && (
+              <div className="rounded-xl border border-gray-800 bg-gray-950/40 p-4 text-sm">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <span className="rounded-full bg-blue-500/10 px-2 py-1 text-xs text-blue-300">total {lastImport.summary.total}</span>
+                  <span className="rounded-full bg-green-500/10 px-2 py-1 text-xs text-green-300">created {lastImport.summary.created}</span>
+                  <span className="rounded-full bg-cyan-500/10 px-2 py-1 text-xs text-cyan-300">updated {lastImport.summary.updated}</span>
+                  <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs text-amber-300">skipped {lastImport.summary.skipped}</span>
+                  <span className="rounded-full bg-red-500/10 px-2 py-1 text-xs text-red-300">failed {lastImport.summary.failed}</span>
+                  {lastImport.dry_run && (
+                    <span className="rounded-full bg-violet-500/10 px-2 py-1 text-xs text-violet-300">dry run</span>
+                  )}
+                </div>
+                <div className="max-h-48 space-y-2 overflow-y-auto">
+                  {lastImport.results.map(result => (
+                    <div key={`${result.index}-${result.name ?? 'unknown'}`} className="rounded-lg border border-gray-800 px-3 py-2 text-xs">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="font-medium text-gray-200">{result.name || `Item ${result.index + 1}`}</span>
+                        <span className="text-gray-500">{result.action}</span>
+                      </div>
+                      {result.error && (
+                        <div className="mt-1 text-red-400">{result.error}</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -265,13 +467,9 @@ export default function AddDomainModal({ onClose }: Props) {
               <button type="button" onClick={onClose} className="btn-ghost flex-1 border border-gray-700">
                 Cancel
               </button>
-              <button
-                type="submit"
-                className="btn-primary flex-1"
-                disabled={mutation.isPending}
-              >
+              <button type="submit" className="btn-primary flex-1" disabled={isBusy}>
                 <Plus size={15} />
-                {mutation.isPending ? 'Adding...' : bulkMode ? 'Import All' : 'Add Domain'}
+                {isBusy ? 'Working...' : mode === 'single' ? 'Add Domain' : dryRun ? 'Validate Import' : 'Run Import'}
               </button>
             </div>
           </form>
@@ -279,6 +477,70 @@ export default function AddDomainModal({ onClose }: Props) {
       </div>
     </div>
   )
+}
+
+function buildImportDefaults(args: {
+  tags: string[]
+  metadata: Record<string, string>
+  enabled: boolean
+  interval: number
+  port: number
+  folderID?: number
+  customCAPEM: string
+  checkMode: string
+  dnsServers: string
+}): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    enabled: args.enabled,
+    check_interval: args.interval,
+    port: args.port,
+    check_mode: args.checkMode,
+  }
+
+  if (args.tags.length > 0) out.tags = args.tags
+  const metadata = normalizeMetadata(args.metadata)
+  if (Object.keys(metadata).length > 0) out.metadata = metadata
+  if (args.folderID) out.folder_id = args.folderID
+  if (args.customCAPEM.trim()) out.custom_ca_pem = args.customCAPEM.trim()
+  if (args.dnsServers.trim()) out.dns_servers = args.dnsServers.trim()
+
+  return out
+}
+
+function parseJSONImportText(text: string): DomainImportRequest {
+  const parsed = JSON.parse(text) as unknown
+  if (Array.isArray(parsed)) {
+    return { domains: normalizeImportDomains(parsed) }
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('JSON import must be an array or an object with a domains field.')
+  }
+
+  const payload = parsed as Record<string, unknown>
+  const domains = payload.domains
+  if (!Array.isArray(domains)) {
+    throw new Error('JSON import object must contain a domains array.')
+  }
+
+  return {
+    mode: payload.mode as 'create_only' | 'upsert' | undefined,
+    dry_run: typeof payload.dry_run === 'boolean' ? payload.dry_run : undefined,
+    trigger_checks: typeof payload.trigger_checks === 'boolean' ? payload.trigger_checks : undefined,
+    defaults: (payload.defaults as Record<string, unknown> | undefined) ?? undefined,
+    domains: normalizeImportDomains(domains),
+  }
+}
+
+function normalizeImportDomains(items: unknown[]): Array<Record<string, unknown>> {
+  return items.map((item) => {
+    if (typeof item === 'string') {
+      return { name: item }
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error('Each imported domain entry must be a string or object.')
+    }
+    return item as Record<string, unknown>
+  })
 }
 
 function extractErrorMessage(err: unknown): string {
@@ -289,16 +551,42 @@ function extractErrorMessage(err: unknown): string {
     if (status === 409) {
       return backendMessage || 'Domain already exists.'
     }
-    if (status === 401) {
-      return 'Unauthorized. Please log in first.'
-    }
     if (backendMessage) {
       return backendMessage
     }
-    if (err.message) {
-      return err.message
-    }
   }
 
-  return 'Failed to add domain.'
+  if (err instanceof Error) {
+    return err.message
+  }
+
+  return 'Request failed. Please try again.'
 }
+
+const JSON_PLACEHOLDER = `{
+  "mode": "upsert",
+  "dry_run": true,
+  "trigger_checks": false,
+  "defaults": {
+    "tags": ["enterprise", "prod"],
+    "metadata": {
+      "owner": "Platform Team",
+      "zone": "corp"
+    },
+    "check_mode": "ssl_only"
+  },
+  "domains": [
+    {
+      "domain": "example.com",
+      "type": "public",
+      "owner": "Web Team"
+    },
+    {
+      "domain": "vcenter.local",
+      "metadata": {
+        "owner": "Virtualization Team",
+        "change_id": "CHG-001"
+      }
+    }
+  ]
+}`
