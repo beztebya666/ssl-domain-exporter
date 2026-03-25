@@ -1,12 +1,16 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
-import { X, Plus, Upload, FolderPlus, FileJson, ListChecks } from 'lucide-react'
-import { createDomain, fetchFolders, createFolder, fetchConfig, importDomains } from '../api/client'
+import { Clock3, FileJson, FolderPlus, ListChecks, Plus, Server, Settings2, Shield, Upload } from 'lucide-react'
+import { createDomain, fetchFolders, createFolder, fetchBootstrap, fetchCustomFields, importDomains } from '../api/client'
 import type { DomainImportRequest, DomainImportResponse } from '../types'
 import TagEditor from './TagEditor'
 import MetadataEditor from './MetadataEditor'
 import { normalizeMetadata } from '../lib/domainFields'
+import { mergeSchemaAndExtraMetadata, splitMetadataBySchema } from '../lib/customFields'
+import CustomFieldInputs from './CustomFieldInputs'
+import CollapsiblePanel from './CollapsiblePanel'
+import ModalShell from './ModalShell'
 
 interface Props {
   onClose: () => void
@@ -45,13 +49,17 @@ export default function AddDomainModal({ onClose }: Props) {
 
   const qc = useQueryClient()
   const { data: folders = [] } = useQuery({ queryKey: ['folders'], queryFn: fetchFolders })
-  const { data: cfg } = useQuery({ queryKey: ['config'], queryFn: fetchConfig })
+  const { data: cfg } = useQuery({ queryKey: ['bootstrap'], queryFn: fetchBootstrap })
+  const { data: customFields = [] } = useQuery({ queryKey: ['custom-fields'], queryFn: () => fetchCustomFields(false) })
 
   const mutation = useMutation({
     mutationFn: createDomain,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['domains'] })
+      qc.invalidateQueries({ queryKey: ['domains-page'] })
+      qc.invalidateQueries({ queryKey: ['dashboard-domains-page'] })
       qc.invalidateQueries({ queryKey: ['summary'] })
+      qc.invalidateQueries({ queryKey: ['tags'] })
     },
   })
 
@@ -61,7 +69,10 @@ export default function AddDomainModal({ onClose }: Props) {
       setLastImport(result)
       if (!result.dry_run) {
         qc.invalidateQueries({ queryKey: ['domains'] })
+        qc.invalidateQueries({ queryKey: ['domains-page'] })
+        qc.invalidateQueries({ queryKey: ['dashboard-domains-page'] })
         qc.invalidateQueries({ queryKey: ['summary'] })
+        qc.invalidateQueries({ queryKey: ['tags'] })
       }
     },
   })
@@ -77,6 +88,7 @@ export default function AddDomainModal({ onClose }: Props) {
 
   const selectedFolderID = folderValue ? Number(folderValue) : undefined
   const effectiveMode = checkMode || cfg?.domains.default_check_mode || 'full'
+  const metadataSplit = useMemo(() => splitMetadataBySchema(metadata, customFields), [customFields, metadata])
   const importDefaults = useMemo(() => buildImportDefaults({
     tags,
     metadata,
@@ -197,34 +209,13 @@ export default function AddDomainModal({ onClose }: Props) {
   const isImportMode = mode !== 'single'
   const isBusy = mutation.isPending || importMutation.isPending
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        onClose()
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onClose])
-
   return (
-    <div
-      className="fixed inset-0 z-50 overflow-y-auto bg-black/75 p-4 md:flex md:items-center md:justify-center"
-      onClick={onClose}
+    <ModalShell
+      onClose={onClose}
+      panelClassName="my-4 flex max-h-[calc(100vh-2rem)] max-w-5xl flex-col overflow-hidden"
+      title={<h2 id="add-domains-title">Add Domains</h2>}
+      bodyClassName="overflow-y-auto"
     >
-      <div
-        className="my-4 flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-gray-700 bg-gray-900 shadow-2xl"
-        onClick={event => event.stopPropagation()}
-      >
-        <div className="flex items-center justify-between border-b border-gray-800 p-5">
-          <h2 className="font-semibold text-white">Add Domains</h2>
-          <button onClick={onClose} className="btn-ghost rounded-lg p-1.5">
-            <X size={16} />
-          </button>
-        </div>
-
-        <div className="overflow-y-auto p-5">
           <div className="mb-5 grid grid-cols-1 gap-2 md:grid-cols-3">
             <button
               className={`btn text-xs ${mode === 'single' ? 'btn-primary' : 'btn-ghost border border-gray-700'}`}
@@ -249,185 +240,232 @@ export default function AddDomainModal({ onClose }: Props) {
           </div>
 
           <form onSubmit={mode === 'single' ? handleSingle : mode === 'lines' ? handleLinesImport : handleJSONImport} className="space-y-5">
-            {mode === 'single' && (
-              <div>
-                <label className="label">Domain name</label>
-                <input
-                  className="input"
-                  placeholder="example.com"
-                  value={name}
-                  onChange={e => setName(e.target.value)}
-                  required
-                />
-                <p className="mt-1 text-xs text-gray-500">`https://` or path parts are removed automatically.</p>
-              </div>
-            )}
+            <CollapsiblePanel
+              title={mode === 'single' ? 'Single domain source' : mode === 'lines' ? 'Line import source' : 'JSON import source'}
+              description={mode === 'single'
+                ? 'Create one monitored endpoint with shared enterprise defaults.'
+                : mode === 'lines'
+                  ? 'Import a plain list of domains while applying the defaults below.'
+                  : 'Import structured records with metadata, tags, and custom inventory fields.'}
+              icon={mode === 'single' ? Server : mode === 'lines' ? ListChecks : FileJson}
+              defaultOpen
+            >
+              {mode === 'single' && (
+                <div>
+                  <label className="label" htmlFor="single-domain-name">Domain name</label>
+                  <input
+                    id="single-domain-name"
+                    className="input"
+                    placeholder="example.com"
+                    value={name}
+                    onChange={e => setName(e.target.value)}
+                    required
+                  />
+                  <p className="mt-1 text-xs text-gray-500">`https://` or path parts are removed automatically.</p>
+                </div>
+              )}
 
-            {mode === 'lines' && (
-              <div>
-                <label className="label">Domains (one per line)</label>
-                <textarea
-                  className="input h-36 resize-y font-mono"
-                  placeholder="example.com&#10;another.org&#10;# comments are ignored"
-                  value={bulkText}
-                  onChange={e => setBulkText(e.target.value)}
-                  required
-                />
-                <p className="mt-1 text-xs text-gray-500">Shared defaults below apply to every imported domain.</p>
-              </div>
-            )}
+              {mode === 'lines' && (
+                <div>
+                  <label className="label" htmlFor="bulk-domain-lines">Domains (one per line)</label>
+                  <textarea
+                    id="bulk-domain-lines"
+                    className="input h-36 resize-y font-mono"
+                    placeholder="example.com&#10;another.org&#10;# comments are ignored"
+                    value={bulkText}
+                    onChange={e => setBulkText(e.target.value)}
+                    required
+                  />
+                  <p className="mt-1 text-xs text-gray-500">Shared defaults below apply to every imported domain.</p>
+                </div>
+              )}
 
-            {mode === 'json' && (
-              <div>
-                <label className="label">JSON payload</label>
-                <textarea
-                  className="input h-64 resize-y font-mono text-xs"
-                  placeholder={JSON_PLACEHOLDER}
-                  value={jsonText}
-                  onChange={e => setJsonText(e.target.value)}
-                  required
-                />
-                <p className="mt-1 text-xs text-gray-500">Supports top-level objects with a `domains` array or a plain array. Unknown item fields are stored in metadata automatically.</p>
-              </div>
-            )}
+              {mode === 'json' && (
+                <div>
+                  <label className="label" htmlFor="json-domain-payload">JSON payload</label>
+                  <textarea
+                    id="json-domain-payload"
+                    className="input h-64 resize-y font-mono text-xs"
+                    placeholder={JSON_PLACEHOLDER}
+                    value={jsonText}
+                    onChange={e => setJsonText(e.target.value)}
+                    required
+                  />
+                  <p className="mt-1 text-xs text-gray-500">Supports top-level objects with a `domains` array or a plain array. Unknown item fields are stored in metadata automatically.</p>
+                </div>
+              )}
+            </CollapsiblePanel>
 
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <div>
-                <label className="label">Tags</label>
-                <TagEditor tags={tags} onChange={setTags} placeholder="production api owner-team" />
-              </div>
+            <CollapsiblePanel
+              title="Inventory & ownership"
+              description="Tags, schema-driven custom fields, and extra metadata for business context."
+              icon={Server}
+              defaultOpen
+            >
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div>
+                  <label className="label">Tags</label>
+                  <TagEditor tags={tags} onChange={setTags} placeholder="production api owner-team" />
+                </div>
 
-              <div>
-                <label className="label">Metadata</label>
-                <MetadataEditor value={metadata} onChange={setMetadata} />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-              <div>
-                <label className="label">Check interval</label>
-                <select className="input" value={interval} onChange={e => setInterval(Number(e.target.value))}>
-                  {INTERVALS.map(item => (
-                    <option key={item.value} value={item.value}>{item.label}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="label">HTTPS Port</label>
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  max={65535}
-                  value={port}
-                  onChange={e => setPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))}
-                />
-              </div>
-
-              <div>
-                <label className="label">Enabled</label>
-                <select className="input" value={enabled ? 'true' : 'false'} onChange={e => setEnabled(e.target.value === 'true')}>
-                  <option value="true">Enabled</option>
-                  <option value="false">Disabled</option>
-                </select>
+                <div>
+                  <label className="label">Metadata</label>
+                  <MetadataEditor
+                    value={metadataSplit.extraMetadata}
+                    onChange={extraMetadata => setMetadata(mergeSchemaAndExtraMetadata(metadataSplit.schemaMetadata, extraMetadata))}
+                  />
+                </div>
               </div>
 
-              <div>
-                <label className="label">Folder</label>
-                <select className="input" value={folderValue} onChange={e => setFolderValue(e.target.value)}>
-                  <option value="">No folder</option>
-                  {folders.map(folder => (
-                    <option key={folder.id} value={folder.id}>{folder.name}</option>
-                  ))}
-                </select>
+              <div className="mt-4">
+                <CustomFieldInputs fields={customFields} metadata={metadata} onChange={setMetadata} />
               </div>
+            </CollapsiblePanel>
 
-              <div>
-                <label className="label">Check mode</label>
-                <select className="input" value={checkMode} onChange={e => setCheckMode(e.target.value)}>
-                  <option value="">Default ({cfg?.domains.default_check_mode || 'full'})</option>
-                  <option value="full">Full (SSL + Domain Registration)</option>
-                  <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
-                </select>
-                <p className="mt-1 text-xs text-gray-500">SSL Only skips domain registration lookup for internal names such as `.local` or `.internal`.</p>
-              </div>
+            <CollapsiblePanel
+              title="Monitoring defaults"
+              description="Scheduling, endpoint port, folder placement, registration lookup policy, and DNS overrides."
+              icon={Clock3}
+              defaultOpen
+            >
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div>
+                  <label className="label">Check interval</label>
+                  <select className="select" value={interval} onChange={e => setInterval(Number(e.target.value))}>
+                    {INTERVALS.map(item => (
+                      <option key={item.value} value={item.value}>{item.label}</option>
+                    ))}
+                  </select>
+                </div>
 
-              <div>
-                <label className="label">DNS Servers</label>
-                <input
-                  className="input"
-                  placeholder="10.0.0.1:53, 10.0.0.2:53"
-                  value={dnsServers}
-                  onChange={e => setDnsServers(e.target.value)}
-                />
-                <p className="mt-1 text-xs text-gray-500">Per-domain DNS servers. Overrides global DNS config.</p>
+                <div>
+                  <label className="label">HTTPS Port</label>
+                  <input
+                    className="input"
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={port}
+                    onChange={e => setPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))}
+                  />
+                </div>
+
+                <div>
+                  <label className="label">Enabled</label>
+                  <select className="select" value={enabled ? 'true' : 'false'} onChange={e => setEnabled(e.target.value === 'true')}>
+                    <option value="true">Enabled</option>
+                    <option value="false">Disabled</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="label">Folder</label>
+                  <select className="select" value={folderValue} onChange={e => setFolderValue(e.target.value)}>
+                    <option value="">No folder</option>
+                    {folders.map(folder => (
+                      <option key={folder.id} value={folder.id}>{folder.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="label">Check mode</label>
+                  <select className="select" value={checkMode} onChange={e => setCheckMode(e.target.value)}>
+                    <option value="">Default ({cfg?.domains.default_check_mode || 'full'})</option>
+                    <option value="full">Full (SSL + Domain Registration)</option>
+                    <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
+                  </select>
+                  <p className="mt-1 text-xs text-gray-500">SSL Only skips domain registration lookup for internal names such as `.local` or `.internal`.</p>
+                </div>
+
+                <div>
+                  <label className="label">DNS Servers</label>
+                  <input
+                    className="input"
+                    placeholder="10.0.0.1:53, 10.0.0.2:53"
+                    value={dnsServers}
+                    onChange={e => setDnsServers(e.target.value)}
+                  />
+                  <p className="mt-1 text-xs text-gray-500">Per-domain DNS servers. Overrides global DNS config.</p>
+                </div>
               </div>
-            </div>
+            </CollapsiblePanel>
 
             {isImportMode && (
-              <>
-                <div className="grid grid-cols-1 gap-4 rounded-xl border border-gray-800 bg-gray-950/40 p-4 md:grid-cols-3">
+              <CollapsiblePanel
+                title="Import execution"
+                description="Control upsert behavior, validation-only runs, and post-import checks."
+                icon={Settings2}
+                defaultOpen
+              >
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
                   <div>
                     <label className="label">Import mode</label>
-                    <select className="input" value={importMode} onChange={e => setImportMode(e.target.value as 'create_only' | 'upsert')}>
+                    <select className="select" value={importMode} onChange={e => setImportMode(e.target.value as 'create_only' | 'upsert')}>
                       <option value="create_only">Create only</option>
                       <option value="upsert">Upsert existing domains</option>
                     </select>
                   </div>
                   <label className="flex items-center gap-2 rounded-lg border border-gray-800 px-3 py-2 text-sm text-gray-300">
-                    <input type="checkbox" checked={dryRun} onChange={e => setDryRun(e.target.checked)} />
+                    <input className="checkbox" type="checkbox" checked={dryRun} onChange={e => setDryRun(e.target.checked)} />
                     Dry run only
                   </label>
                   <label className="flex items-center gap-2 rounded-lg border border-gray-800 px-3 py-2 text-sm text-gray-300">
-                    <input type="checkbox" checked={triggerChecks} onChange={e => setTriggerChecks(e.target.checked)} />
+                    <input className="checkbox" type="checkbox" checked={triggerChecks} onChange={e => setTriggerChecks(e.target.checked)} />
                     Trigger checks after import
                   </label>
                 </div>
                 <div className="text-xs text-gray-500">
                   Shared defaults in this form apply to every imported record. In `upsert` mode, provided defaults can overwrite existing domain settings.
                 </div>
-              </>
+              </CollapsiblePanel>
             )}
 
-            <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[1fr_auto]">
-              <div>
-                <label className="label">Create folder</label>
-                <input
-                  className="input"
-                  placeholder="backend, public-sites, staging"
-                  value={newFolderName}
-                  onChange={e => setNewFolderName(e.target.value)}
-                />
-              </div>
-              <button type="button" className="btn-ghost border border-gray-700" onClick={handleCreateFolder} disabled={folderMutation.isPending}>
-                <FolderPlus size={14} />
-                {folderMutation.isPending ? 'Creating...' : 'Create'}
-              </button>
-            </div>
-
-            <div>
-              <div className="mb-1.5 flex items-center justify-between">
-                <label className="label mb-0">Custom Root CA (optional)</label>
-                <label className="inline-flex cursor-pointer items-center gap-1.5 border border-gray-700 px-2 py-1 text-xs btn-ghost">
-                  <Upload size={12} />
-                  Load .crt/.pem
+            <CollapsiblePanel
+              title="Trust & inventory helpers"
+              description="Folder bootstrap helpers and private trust material for internal PKI environments."
+              icon={Shield}
+              defaultOpen={false}
+            >
+              <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[1fr_auto]">
+                <div>
+                  <label className="label">Create folder</label>
                   <input
-                    type="file"
-                    accept=".crt,.pem,.cer,text/plain"
-                    className="hidden"
-                    onChange={e => loadCertFile(e.target.files?.[0] ?? null)}
+                    className="input"
+                    placeholder="backend, public-sites, staging"
+                    value={newFolderName}
+                    onChange={e => setNewFolderName(e.target.value)}
                   />
-                </label>
+                </div>
+                <button type="button" className="btn-ghost border border-gray-700" onClick={handleCreateFolder} disabled={folderMutation.isPending}>
+                  <FolderPlus size={14} />
+                  {folderMutation.isPending ? 'Creating...' : 'Create'}
+                </button>
               </div>
-              <textarea
-                className="input h-36 resize-y font-mono text-xs"
-                placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
-                value={customCAPEM}
-                onChange={e => setCustomCAPEM(e.target.value)}
-              />
-              <p className="mt-1 text-xs text-gray-500">Used as an additional trust root for SSL and HTTPS checks for this domain.</p>
-            </div>
+
+              <div className="mt-4">
+                <div className="mb-1.5 flex items-center justify-between">
+                  <label className="label mb-0">Custom Root CA (optional)</label>
+                  <label className="inline-flex cursor-pointer items-center gap-1.5 border border-gray-700 px-2 py-1 text-xs btn-ghost">
+                    <Upload size={12} />
+                    Load .crt/.pem
+                    <input
+                      type="file"
+                      accept=".crt,.pem,.cer,text/plain"
+                      className="hidden"
+                      onChange={e => loadCertFile(e.target.files?.[0] ?? null)}
+                    />
+                  </label>
+                </div>
+                <textarea
+                  className="input h-36 resize-y font-mono text-xs"
+                  placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+                  value={customCAPEM}
+                  onChange={e => setCustomCAPEM(e.target.value)}
+                />
+                <p className="mt-1 text-xs text-gray-500">Used as an additional trust root for SSL and HTTPS checks for this domain.</p>
+              </div>
+            </CollapsiblePanel>
 
             {submitError && (
               <div className="rounded-lg border border-amber-600/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
@@ -473,9 +511,7 @@ export default function AddDomainModal({ onClose }: Props) {
               </button>
             </div>
           </form>
-        </div>
-      </div>
-    </div>
+    </ModalShell>
   )
 }
 

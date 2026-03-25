@@ -16,11 +16,12 @@ export default class ErrorBoundary extends Component<Props, State> {
         <div className="flex items-center justify-center h-screen bg-slate-950">
           <div className="max-w-lg p-6 bg-red-900/20 border border-red-700 rounded-xl text-center">
             <h2 className="text-red-400 font-bold text-lg mb-2">Runtime Error</h2>
-            <pre className="text-red-300 text-xs text-left bg-red-900/20 p-3 rounded overflow-auto">
+            <p className="text-red-200 text-sm">
+              The UI hit an unexpected error. You can retry the current screen or refresh the page.
+            </p>
+            <div className="mt-3 text-left rounded bg-red-900/20 p-3 text-xs text-red-300">
               {this.state.error.message}
-              {'\n'}
-              {this.state.error.stack}
-            </pre>
+            </div>
             <button
               className="mt-4 btn-primary"
               onClick={() => this.setState({ error: null })}

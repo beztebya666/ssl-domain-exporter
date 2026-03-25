@@ -7,13 +7,16 @@ database:
 
 auth:
   enabled: true
-  mode: "basic"          # basic | api_key | both
+  mode: "basic"                # basic | api_key | both
   username: "admin"
   password: "admin"
   api_key: ""
   protect_api: true
   protect_metrics: false
   protect_ui: false
+  session_ttl: "24h"
+  cookie_name: "ssl_domain_exporter_session"
+  cookie_secure: false
 
 checker:
   interval: "6h"
@@ -39,7 +42,19 @@ alerts:
   ssl_expiry_warning_days: 14
   ssl_expiry_critical_days: 3
 
+status_policy:
+  badge_on_invalid_chain: true
+  badge_on_self_signed: true
+  badge_on_http_probe_error: true
+  badge_on_http_client_error: true
+  badge_on_cipher_warning: true
+  badge_on_ocsp_unknown: true
+  badge_on_crl_unknown: true
+  badge_on_caa_missing: true
+  badge_on_domain_lookup_error: true
+
 notifications:
+  timeout: "15s"
   webhook:
     enabled: false
     url: ""
@@ -51,16 +66,29 @@ notifications:
     chat_id: ""
     on_critical: true
     on_warning: false
+  email:
+    enabled: false
+    host: ""
+    port: 587
+    username: ""
+    password: ""
+    from: ""
+    to: []
+    mode: "starttls"           # starttls | tls | none
+    on_critical: true
+    on_warning: false
+    subject_prefix: "[SSL Domain Exporter]"
+    insecure_skip_verify: false
 
 domains:
   subdomain_fallback: true
   fallback_depth: 5
-  default_check_mode: "full"   # full | ssl_only — default for newly added domains
+  default_check_mode: "full"   # full | ssl_only, default for newly added domains
 
 dns:
-  servers: []                  # custom DNS servers, e.g. ["10.0.0.1:53", "192.168.1.1:53"]
-  use_system_dns: true         # fallback to system /etc/resolv.conf when custom servers are empty or fail
-  timeout: "5s"                # DNS query timeout
+  servers: []                  # custom DNS servers, e.g. ["10.0.0.1:53", "10.0.0.2:53"]
+  use_system_dns: true         # fallback to OS resolver discovery when custom servers are empty or fail
+  timeout: "5s"
 
 prometheus:
   enabled: true

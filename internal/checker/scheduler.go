@@ -11,13 +11,14 @@ import (
 )
 
 type Scheduler struct {
-	cfg     *config.Config
-	db      *db.DB
-	checker *Checker
-	metrics *metrics.Metrics
-	quit    chan struct{}
-	wg      sync.WaitGroup
-	sem     chan struct{}
+	cfg                *config.Config
+	db                 *db.DB
+	checker            *Checker
+	metrics            *metrics.Metrics
+	quit               chan struct{}
+	wg                 sync.WaitGroup
+	sem                chan struct{}
+	lastSessionCleanup time.Time
 }
 
 func NewScheduler(cfg *config.Config, database *db.DB, chk *Checker, m *metrics.Metrics) *Scheduler {
@@ -67,6 +68,8 @@ func (s *Scheduler) run() {
 }
 
 func (s *Scheduler) tick() {
+	s.cleanupExpiredSessions()
+
 	domains, err := s.db.GetDomainsForScheduling()
 	if err != nil {
 		log.Printf("Scheduler: failed to get domains: %v", err)
@@ -88,6 +91,20 @@ func (s *Scheduler) tick() {
 			s.checker.CheckDomain(&dom)
 		}()
 	}
+}
+
+func (s *Scheduler) cleanupExpiredSessions() {
+	if s.db == nil {
+		return
+	}
+	if !s.lastSessionCleanup.IsZero() && time.Since(s.lastSessionCleanup) < time.Hour {
+		return
+	}
+	if err := s.db.DeleteExpiredSessions(time.Now().UTC()); err != nil {
+		log.Printf("Scheduler: failed to cleanup expired sessions: %v", err)
+		return
+	}
+	s.lastSessionCleanup = time.Now()
 }
 
 // TriggerCheck triggers an immediate check for a specific domain

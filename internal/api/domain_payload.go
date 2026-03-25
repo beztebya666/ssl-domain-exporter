@@ -553,7 +553,7 @@ func asBool(value any) (bool, error) {
 	case bool:
 		return v, nil
 	case string:
-		return parseBool(v), nil
+		return config.ParseBool(v), nil
 	default:
 		return false, fmt.Errorf("must be a boolean")
 	}
