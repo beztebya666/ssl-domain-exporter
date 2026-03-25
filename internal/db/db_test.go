@@ -227,6 +227,117 @@ func TestSaveCheckAndGetAllLastChecksKeepAuditFields(t *testing.T) {
 	}
 }
 
+func TestCustomFieldSchemaCRUDAndValidation(t *testing.T) {
+	database := newTestDB(t)
+	defer database.Close()
+
+	field, err := database.CreateCustomField(CustomField{
+		Key:              "owner_email",
+		Label:            "Owner Email",
+		Type:             "email",
+		Required:         true,
+		VisibleInDetails: true,
+		VisibleInExport:  true,
+		Filterable:       true,
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatalf("create email field: %v", err)
+	}
+	if field.Key != "owner_email" || field.Type != "email" {
+		t.Fatalf("unexpected created field: %+v", field)
+	}
+
+	selectField, err := database.CreateCustomField(CustomField{
+		Key:       "environment",
+		Label:     "Environment",
+		Type:      "select",
+		Enabled:   true,
+		SortOrder: 2,
+		Options: []CustomFieldOption{
+			{Value: "prod", Label: "Production"},
+			{Value: "stage", Label: "Staging"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create select field: %v", err)
+	}
+	if len(selectField.Options) != 2 {
+		t.Fatalf("expected options to round-trip, got %+v", selectField.Options)
+	}
+
+	fields, err := database.ListCustomFields(false)
+	if err != nil {
+		t.Fatalf("list custom fields: %v", err)
+	}
+	if len(fields) != 2 {
+		t.Fatalf("expected 2 enabled fields, got %d", len(fields))
+	}
+
+	if _, err := ValidateMetadataWithCustomFields(map[string]string{
+		"owner_email": "invalid-email",
+		"environment": "prod",
+	}, fields); err == nil {
+		t.Fatal("expected invalid email metadata to fail validation")
+	}
+
+	validMetadata, err := ValidateMetadataWithCustomFields(map[string]string{
+		"owner_email": "platform@example.com",
+		"environment": "prod",
+		"owner":       "platform-team",
+	}, fields)
+	if err != nil {
+		t.Fatalf("validate metadata: %v", err)
+	}
+	if validMetadata["owner"] != "platform-team" {
+		t.Fatalf("expected unknown metadata keys to be preserved, got %#v", validMetadata)
+	}
+
+	updated, err := database.UpdateCustomField(selectField.ID, CustomField{
+		Key:              selectField.Key,
+		Label:            "Environment",
+		Type:             "select",
+		VisibleInTable:   true,
+		VisibleInDetails: true,
+		VisibleInExport:  true,
+		Filterable:       true,
+		Enabled:          false,
+		SortOrder:        3,
+		Options: []CustomFieldOption{
+			{Value: "prod", Label: "Production"},
+			{Value: "qa", Label: "QA"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("update custom field: %v", err)
+	}
+	if updated.Enabled {
+		t.Fatal("expected updated field to be disabled")
+	}
+	if len(updated.Options) != 2 || updated.Options[1].Value != "qa" {
+		t.Fatalf("expected updated options to round-trip, got %+v", updated.Options)
+	}
+
+	enabledFields, err := database.ListCustomFields(false)
+	if err != nil {
+		t.Fatalf("list enabled custom fields: %v", err)
+	}
+	if len(enabledFields) != 1 || enabledFields[0].Key != "owner_email" {
+		t.Fatalf("expected only owner_email to stay enabled, got %+v", enabledFields)
+	}
+
+	if err := database.DeleteCustomField(field.ID); err != nil {
+		t.Fatalf("delete custom field: %v", err)
+	}
+	remaining, err := database.ListCustomFields(true)
+	if err != nil {
+		t.Fatalf("list all fields after delete: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Key != "environment" {
+		t.Fatalf("expected environment field to remain after delete, got %+v", remaining)
+	}
+}
+
 func newTestDB(t *testing.T) *DB {
 	t.Helper()
 

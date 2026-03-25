@@ -276,24 +276,14 @@ func checkWHOIS(domain string, timeout time.Duration) *DomainResult {
 	return result
 }
 
-// whoisWithTimeout wraps whois.Whois with a hard timeout.
-// The likexian/whois library does not natively support timeout control.
+// whoisWithTimeout uses the library client with an explicit network timeout.
 func whoisWithTimeout(domain string, timeout time.Duration) (string, error) {
-	type result struct {
-		raw string
-		err error
+	client := whois.NewClient().SetTimeout(timeout)
+	raw, err := client.Whois(domain)
+	if err != nil {
+		return "", err
 	}
-	ch := make(chan result, 1)
-	go func() {
-		raw, err := whois.Whois(domain)
-		ch <- result{raw, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.raw, r.err
-	case <-time.After(timeout):
-		return "", fmt.Errorf("whois timeout after %s", timeout)
-	}
+	return raw, nil
 }
 
 func parseDate(s string) (*time.Time, *int) {

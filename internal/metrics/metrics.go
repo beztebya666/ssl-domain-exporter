@@ -34,9 +34,11 @@ type Metrics struct {
 	RegistrationCheckEnabled *prometheus.GaugeVec
 	RegistrationCheckSkipped *prometheus.CounterVec
 	DomainTagInfo            *prometheus.GaugeVec
+	DomainMetadataInfo       *prometheus.GaugeVec
 
-	mu         sync.Mutex
-	domainTags map[string]map[string]struct{}
+	mu             sync.Mutex
+	domainTags     map[string]map[string]struct{}
+	domainMetadata map[string]map[string]struct{}
 }
 
 func New() *Metrics {
@@ -84,7 +86,7 @@ func NewWithRegisterer(reg prometheus.Registerer) *Metrics {
 
 		OverallStatus: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "domain_overall_status",
-			Help: "Overall domain status (0=ok, 1=warning, 2=critical, 3=error)",
+			Help: "Overall domain status (0=ok, 1=warning, 2=critical, 3=error, 4=unknown)",
 		}, []string{"domain"}),
 
 		TotalDomains: factory.NewGauge(prometheus.GaugeOpts{
@@ -152,7 +154,13 @@ func NewWithRegisterer(reg prometheus.Registerer) *Metrics {
 			Help: "Static domain tag info metric with value 1 for each domain/tag pair",
 		}, []string{"domain", "tag"}),
 
-		domainTags: make(map[string]map[string]struct{}),
+		DomainMetadataInfo: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "domain_metadata_info",
+			Help: "Static domain metadata info metric with value 1 for each domain metadata key/value pair",
+		}, []string{"domain", "key", "value"}),
+
+		domainTags:     make(map[string]map[string]struct{}),
+		domainMetadata: make(map[string]map[string]struct{}),
 	}
 }
 
@@ -167,6 +175,7 @@ func (m *Metrics) SyncDomain(domain *db.Domain) {
 		return
 	}
 	m.syncDomainTags(domain.Name, domain.Tags)
+	m.syncDomainMetadata(domain.Name, domain.Metadata)
 	if domain.RegistrationCheckEnabled() {
 		m.RegistrationCheckEnabled.WithLabelValues(domain.Name).Set(1)
 	} else {
@@ -255,6 +264,11 @@ func (m *Metrics) CleanupDomain(domain string) {
 		m.DomainTagInfo.DeleteLabelValues(domain, tag)
 	}
 	delete(m.domainTags, domain)
+	for pair := range m.domainMetadata[domain] {
+		key, value := splitMetricPair(pair)
+		m.DomainMetadataInfo.DeleteLabelValues(domain, key, value)
+	}
+	delete(m.domainMetadata, domain)
 	m.mu.Unlock()
 
 	m.SSLExpiryDays.DeleteLabelValues(domain)
@@ -306,6 +320,46 @@ func (m *Metrics) syncDomainTags(domain string, tags []string) {
 	m.domainTags[domain] = normalized
 }
 
+func (m *Metrics) syncDomainMetadata(domain string, metadata map[string]string) {
+	normalized := make(map[string]struct{}, len(metadata))
+	for key, value := range metadata {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" {
+			continue
+		}
+		normalized[joinMetricPair(key, value)] = struct{}{}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	previous := m.domainMetadata[domain]
+	for pair := range previous {
+		if _, stillPresent := normalized[pair]; !stillPresent {
+			key, value := splitMetricPair(pair)
+			m.DomainMetadataInfo.DeleteLabelValues(domain, key, value)
+		}
+	}
+	for pair := range normalized {
+		key, value := splitMetricPair(pair)
+		m.DomainMetadataInfo.WithLabelValues(domain, key, value).Set(1)
+	}
+	m.domainMetadata[domain] = normalized
+}
+
+func joinMetricPair(key, value string) string {
+	return key + "\x00" + value
+}
+
+func splitMetricPair(pair string) (string, string) {
+	parts := strings.SplitN(pair, "\x00", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return pair, ""
+}
+
 func (m *Metrics) SetTotalDomains(n int) {
 	m.TotalDomains.Set(float64(n))
 }
@@ -321,7 +375,7 @@ func statusToFloat(s string) float64 {
 	case "error":
 		return 3
 	default:
-		return 3
+		return 4
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,11 +65,12 @@ func (d *Domain) ParseDNSServers() []string {
 }
 
 type Folder struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	SortOrder int       `json:"sort_order"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	DomainCount int       `json:"domain_count"`
+	SortOrder   int       `json:"sort_order"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Check struct {
@@ -133,8 +135,11 @@ type Check struct {
 	CAAError       string `json:"caa_error"`
 
 	// Overall
-	OverallStatus string `json:"overall_status"` // ok, warning, critical, error
-	CheckDuration int64  `json:"check_duration_ms"`
+	PrimaryReasonCode string         `json:"primary_reason_code"`
+	PrimaryReasonText string         `json:"primary_reason_text"`
+	StatusReasons     []StatusReason `json:"status_reasons,omitempty"`
+	OverallStatus     string         `json:"overall_status"` // ok, warning, critical, error
+	CheckDuration     int64          `json:"check_duration_ms"`
 }
 
 type ChainCert struct {
@@ -144,6 +149,35 @@ type ChainCert struct {
 	ValidTo      time.Time `json:"valid_to"`
 	IsCA         bool      `json:"is_ca"`
 	IsSelfSigned bool      `json:"is_self_signed"`
+}
+
+type StatusReason struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Summary  string `json:"summary"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+type User struct {
+	ID           int64      `json:"id"`
+	Username     string     `json:"username"`
+	Role         string     `json:"role"`
+	Enabled      bool       `json:"enabled"`
+	LastLoginAt  *time.Time `json:"last_login_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	PasswordHash string     `json:"-"`
+}
+
+type Session struct {
+	ID         int64     `json:"id"`
+	UserID     int64     `json:"user_id"`
+	TokenHash  string    `json:"-"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	UserAgent  string    `json:"user_agent"`
+	RemoteAddr string    `json:"remote_addr"`
 }
 
 type Settings struct {
@@ -239,6 +273,9 @@ func (d *DB) Migrate() error {
 			caa TEXT DEFAULT '',
 			caa_query_domain TEXT DEFAULT '',
 			caa_error TEXT DEFAULT '',
+			primary_reason_code TEXT DEFAULT '',
+			primary_reason_text TEXT DEFAULT '',
+			status_reasons_json TEXT DEFAULT '[]',
 			overall_status TEXT DEFAULT 'unknown',
 			check_duration_ms INTEGER DEFAULT 0
 		);
@@ -248,8 +285,63 @@ func (d *DB) Migrate() error {
 			value TEXT NOT NULL
 		);
 
+		CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'viewer',
+			enabled INTEGER DEFAULT 1,
+			last_login_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS user_sessions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			token_hash TEXT UNIQUE NOT NULL,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			user_agent TEXT DEFAULT '',
+			remote_addr TEXT DEFAULT ''
+		);
+
+		CREATE TABLE IF NOT EXISTS custom_fields (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			key TEXT UNIQUE NOT NULL,
+			label TEXT NOT NULL,
+			type TEXT NOT NULL DEFAULT 'text',
+			required INTEGER DEFAULT 0,
+			placeholder TEXT DEFAULT '',
+			help_text TEXT DEFAULT '',
+			sort_order INTEGER DEFAULT 0,
+			visible_in_table INTEGER DEFAULT 0,
+			visible_in_details INTEGER DEFAULT 1,
+			visible_in_export INTEGER DEFAULT 1,
+			filterable INTEGER DEFAULT 0,
+			enabled INTEGER DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS custom_field_options (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			field_id INTEGER NOT NULL REFERENCES custom_fields(id) ON DELETE CASCADE,
+			value TEXT NOT NULL,
+			label TEXT NOT NULL,
+			sort_order INTEGER DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(field_id, value)
+		);
+
 		CREATE INDEX IF NOT EXISTS idx_checks_domain_id ON domain_checks(domain_id);
 		CREATE INDEX IF NOT EXISTS idx_checks_checked_at ON domain_checks(checked_at);
+		CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
+		CREATE INDEX IF NOT EXISTS idx_user_sessions_expires_at ON user_sessions(expires_at);
+		CREATE INDEX IF NOT EXISTS idx_custom_fields_sort_order ON custom_fields(sort_order);
+		CREATE INDEX IF NOT EXISTS idx_custom_field_options_field_id ON custom_field_options(field_id);
 	`)
 	if err != nil {
 		return err
@@ -308,6 +400,9 @@ func (d *DB) Migrate() error {
 		{"registration_check_skipped", "INTEGER DEFAULT 0"},
 		{"registration_skip_reason", "TEXT DEFAULT ''"},
 		{"dns_server_used", "TEXT DEFAULT ''"},
+		{"primary_reason_code", "TEXT DEFAULT ''"},
+		{"primary_reason_text", "TEXT DEFAULT ''"},
+		{"status_reasons_json", "TEXT DEFAULT '[]'"},
 	} {
 		if err := d.addColumnIfMissing("domain_checks", col.name, col.def); err != nil {
 			return err
@@ -320,11 +415,16 @@ func (d *DB) Migrate() error {
 	if err := d.backfillFolderSortOrder(); err != nil {
 		return err
 	}
+	if err := d.backfillCustomFieldSortOrder(); err != nil {
+		return err
+	}
 	// Create indexes only after all required columns are present for old DBs.
 	if _, err := d.sql.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_domains_sort_order ON domains(sort_order);
 		CREATE INDEX IF NOT EXISTS idx_domains_folder_id ON domains(folder_id);
 		CREATE INDEX IF NOT EXISTS idx_folders_sort_order ON folders(sort_order);
+		CREATE INDEX IF NOT EXISTS idx_custom_fields_sort_order ON custom_fields(sort_order);
+		CREATE INDEX IF NOT EXISTS idx_custom_field_options_field_id ON custom_field_options(field_id);
 	`); err != nil {
 		return err
 	}
@@ -378,8 +478,14 @@ func (d *DB) CreateDomain(name string, tags []string, metadata map[string]string
 	if err != nil {
 		return nil, err
 	}
-	tagsJSON, _ := json.Marshal(tags)
-	metadataJSON, _ := json.Marshal(metadata)
+	tagsJSON, err := json.Marshal(tags)
+	if err != nil {
+		return nil, fmt.Errorf("marshal domain tags json: %w", err)
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("marshal domain metadata json: %w", err)
+	}
 	sortOrder, err := d.nextDomainSortOrder()
 	if err != nil {
 		return nil, err
@@ -409,8 +515,14 @@ func (d *DB) UpdateDomain(id int64, name string, tags []string, metadata map[str
 	if err != nil {
 		return err
 	}
-	tagsJSON, _ := json.Marshal(tags)
-	metadataJSON, _ := json.Marshal(metadata)
+	tagsJSON, err := json.Marshal(tags)
+	if err != nil {
+		return fmt.Errorf("marshal domain tags json: %w", err)
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("marshal domain metadata json: %w", err)
+	}
 	_, err = d.sql.Exec(`
 		UPDATE domains SET name=?, port=?, tags=?, tags_json=?, metadata_json=?, folder_id=?, custom_ca_pem=?, check_mode=?, dns_servers=?, enabled=?, check_interval=?, updated_at=CURRENT_TIMESTAMP
 		WHERE id=?`, name, port, tagsText, string(tagsJSON), string(metadataJSON), folderID, customCAPEM, checkMode, dnsServers, enabled, interval, id)
@@ -453,6 +565,7 @@ const checkInsertCols = `domain_id, checked_at,
 	cipher_weak, cipher_weak_reason, cipher_grade, cipher_details,
 	ocsp_status, ocsp_error, crl_status, crl_error,
 	caa_present, caa, caa_query_domain, caa_error,
+	primary_reason_code, primary_reason_text, status_reasons_json,
 	overall_status, check_duration_ms`
 
 const checkSelectCols = `id, domain_id, checked_at,
@@ -466,11 +579,19 @@ const checkSelectCols = `id, domain_id, checked_at,
 	cipher_weak, cipher_weak_reason, cipher_grade, cipher_details,
 	ocsp_status, ocsp_error, crl_status, crl_error,
 	caa_present, caa, caa_query_domain, caa_error,
+	primary_reason_code, primary_reason_text, status_reasons_json,
 	overall_status, check_duration_ms`
 
 func (d *DB) SaveCheck(c *Check) error {
-	chainJSON, _ := json.Marshal(c.SSLChainDetails)
-	_, err := d.sql.Exec(`INSERT INTO domain_checks (`+checkInsertCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	chainJSON, err := json.Marshal(c.SSLChainDetails)
+	if err != nil {
+		return fmt.Errorf("marshal ssl chain details json: %w", err)
+	}
+	reasonsJSON, err := json.Marshal(c.StatusReasons)
+	if err != nil {
+		return fmt.Errorf("marshal status reasons json: %w", err)
+	}
+	args := []any{
 		c.DomainID, c.CheckedAt,
 		c.DomainStatus, c.DomainRegistrar, c.DomainCreatedAt, c.DomainExpiresAt,
 		c.DomainExpiryDays, c.DomainCheckError, c.DomainSource,
@@ -482,8 +603,11 @@ func (d *DB) SaveCheck(c *Check) error {
 		c.CipherWeak, c.CipherWeakReason, c.CipherGrade, c.CipherDetails,
 		c.OCSPStatus, c.OCSPError, c.CRLStatus, c.CRLError,
 		c.CAAPresent, c.CAA, c.CAAQueryDomain, c.CAAError,
+		c.PrimaryReasonCode, c.PrimaryReasonText, string(reasonsJSON),
 		c.OverallStatus, c.CheckDuration,
-	)
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(args)), ",")
+	_, err = d.sql.Exec(`INSERT INTO domain_checks (`+checkInsertCols+`) VALUES (`+placeholders+`)`, args...)
 	return err
 }
 
@@ -495,10 +619,28 @@ func (d *DB) GetCheckHistory(domainID int64, limit int) ([]Check, error) {
 	if limit == 0 {
 		limit = 50
 	}
+	return d.GetCheckHistoryPage(domainID, limit, 0)
+}
+
+func (d *DB) GetCheckHistoryPage(domainID int64, limit, offset int) ([]Check, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	rows, err := d.sql.Query(`SELECT `+checkSelectCols+` FROM domain_checks WHERE domain_id = ? ORDER BY checked_at DESC LIMIT ?`,
 		domainID, limit)
 	if err != nil {
 		return nil, err
+	}
+	if offset > 0 {
+		rows.Close()
+		rows, err = d.sql.Query(`SELECT `+checkSelectCols+` FROM domain_checks WHERE domain_id = ? ORDER BY checked_at DESC LIMIT ? OFFSET ?`,
+			domainID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 
@@ -511,6 +653,12 @@ func (d *DB) GetCheckHistory(domainID int64, limit int) ([]Check, error) {
 		checks = append(checks, *c)
 	}
 	return checks, rows.Err()
+}
+
+func (d *DB) CountCheckHistory(domainID int64) (int, error) {
+	var total int
+	err := d.sql.QueryRow(`SELECT COUNT(*) FROM domain_checks WHERE domain_id = ?`, domainID).Scan(&total)
+	return total, err
 }
 
 func (d *DB) GetAllLastChecks() (map[int64]*Check, error) {
@@ -573,8 +721,16 @@ func (d *DB) GetAllSettings() (map[string]string, error) {
 
 func (d *DB) GetFolders() ([]Folder, error) {
 	rows, err := d.sql.Query(`
-		SELECT id, name, sort_order, created_at, updated_at
-		FROM folders
+		SELECT
+			f.id,
+			f.name,
+			COUNT(d.id) AS domain_count,
+			f.sort_order,
+			f.created_at,
+			f.updated_at
+		FROM folders f
+		LEFT JOIN domains d ON d.folder_id = f.id
+		GROUP BY f.id, f.name, f.sort_order, f.created_at, f.updated_at
 		ORDER BY sort_order ASC, name ASC
 	`)
 	if err != nil {
@@ -585,7 +741,7 @@ func (d *DB) GetFolders() ([]Folder, error) {
 	folders := make([]Folder, 0)
 	for rows.Next() {
 		var f Folder
-		if err := rows.Scan(&f.ID, &f.Name, &f.SortOrder, &f.CreatedAt, &f.UpdatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.Name, &f.DomainCount, &f.SortOrder, &f.CreatedAt, &f.UpdatedAt); err != nil {
 			return nil, err
 		}
 		folders = append(folders, f)
@@ -611,10 +767,18 @@ func (d *DB) CreateFolder(name string) (*Folder, error) {
 func (d *DB) GetFolderByID(id int64) (*Folder, error) {
 	var f Folder
 	err := d.sql.QueryRow(`
-		SELECT id, name, sort_order, created_at, updated_at
-		FROM folders
-		WHERE id = ?
-	`, id).Scan(&f.ID, &f.Name, &f.SortOrder, &f.CreatedAt, &f.UpdatedAt)
+		SELECT
+			f.id,
+			f.name,
+			COUNT(d.id) AS domain_count,
+			f.sort_order,
+			f.created_at,
+			f.updated_at
+		FROM folders f
+		LEFT JOIN domains d ON d.folder_id = f.id
+		WHERE f.id = ?
+		GROUP BY f.id, f.name, f.sort_order, f.created_at, f.updated_at
+	`, id).Scan(&f.ID, &f.Name, &f.DomainCount, &f.SortOrder, &f.CreatedAt, &f.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -688,7 +852,9 @@ func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, fol
 		dom.CheckMode = "full"
 	}
 	if strings.TrimSpace(tagsJSON) != "" {
-		_ = json.Unmarshal([]byte(tagsJSON), &dom.Tags)
+		if err := json.Unmarshal([]byte(tagsJSON), &dom.Tags); err != nil {
+			log.Printf("db: failed to parse tags_json for domain %q: %v", dom.Name, err)
+		}
 	}
 	if len(dom.Tags) == 0 {
 		dom.Tags = ParseLegacyTags(tagsRaw)
@@ -698,7 +864,9 @@ func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, fol
 		dom.Tags = []string{}
 	}
 	if strings.TrimSpace(metadataJSON) != "" {
-		_ = json.Unmarshal([]byte(metadataJSON), &dom.Metadata)
+		if err := json.Unmarshal([]byte(metadataJSON), &dom.Metadata); err != nil {
+			log.Printf("db: failed to parse metadata_json for domain %q: %v", dom.Name, err)
+		}
 	}
 	if dom.Metadata != nil {
 		if normalized, err := ValidateAndNormalizeMetadata(dom.Metadata); err == nil {
@@ -716,7 +884,7 @@ func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, fol
 
 func (d *DB) scanCheck(row *sql.Row) (*Check, error) {
 	var c Check
-	var chainJSON string
+	var chainJSON, reasonsJSON string
 	var domCreatedAt, domExpiresAt, sslValidFrom, sslValidUntil sql.NullTime
 	err := row.Scan(
 		&c.ID, &c.DomainID, &c.CheckedAt,
@@ -730,6 +898,7 @@ func (d *DB) scanCheck(row *sql.Row) (*Check, error) {
 		&c.CipherWeak, &c.CipherWeakReason, &c.CipherGrade, &c.CipherDetails,
 		&c.OCSPStatus, &c.OCSPError, &c.CRLStatus, &c.CRLError,
 		&c.CAAPresent, &c.CAA, &c.CAAQueryDomain, &c.CAAError,
+		&c.PrimaryReasonCode, &c.PrimaryReasonText, &reasonsJSON,
 		&c.OverallStatus, &c.CheckDuration,
 	)
 	if err == sql.ErrNoRows {
@@ -739,13 +908,18 @@ func (d *DB) scanCheck(row *sql.Row) (*Check, error) {
 		return nil, err
 	}
 	applyNullTimes(&c, domCreatedAt, domExpiresAt, sslValidFrom, sslValidUntil)
-	json.Unmarshal([]byte(chainJSON), &c.SSLChainDetails)
+	if err := json.Unmarshal([]byte(chainJSON), &c.SSLChainDetails); err != nil && strings.TrimSpace(chainJSON) != "" {
+		log.Printf("db: failed to parse ssl_chain_details for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+	}
+	if err := json.Unmarshal([]byte(reasonsJSON), &c.StatusReasons); err != nil && strings.TrimSpace(reasonsJSON) != "" {
+		log.Printf("db: failed to parse status_reasons_json for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+	}
 	return &c, nil
 }
 
 func (d *DB) scanCheckRow(rows *sql.Rows) (*Check, error) {
 	var c Check
-	var chainJSON string
+	var chainJSON, reasonsJSON string
 	var domCreatedAt, domExpiresAt, sslValidFrom, sslValidUntil sql.NullTime
 	err := rows.Scan(
 		&c.ID, &c.DomainID, &c.CheckedAt,
@@ -759,13 +933,19 @@ func (d *DB) scanCheckRow(rows *sql.Rows) (*Check, error) {
 		&c.CipherWeak, &c.CipherWeakReason, &c.CipherGrade, &c.CipherDetails,
 		&c.OCSPStatus, &c.OCSPError, &c.CRLStatus, &c.CRLError,
 		&c.CAAPresent, &c.CAA, &c.CAAQueryDomain, &c.CAAError,
+		&c.PrimaryReasonCode, &c.PrimaryReasonText, &reasonsJSON,
 		&c.OverallStatus, &c.CheckDuration,
 	)
 	if err != nil {
 		return nil, err
 	}
 	applyNullTimes(&c, domCreatedAt, domExpiresAt, sslValidFrom, sslValidUntil)
-	json.Unmarshal([]byte(chainJSON), &c.SSLChainDetails)
+	if err := json.Unmarshal([]byte(chainJSON), &c.SSLChainDetails); err != nil && strings.TrimSpace(chainJSON) != "" {
+		log.Printf("db: failed to parse ssl_chain_details for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+	}
+	if err := json.Unmarshal([]byte(reasonsJSON), &c.StatusReasons); err != nil && strings.TrimSpace(reasonsJSON) != "" {
+		log.Printf("db: failed to parse status_reasons_json for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+	}
 	return &c, nil
 }
 
@@ -848,7 +1028,7 @@ func (d *DB) backfillDomainSortOrder() error {
 func (d *DB) backfillFolderSortOrder() error {
 	rows, err := d.sql.Query(`SELECT id FROM folders ORDER BY created_at ASC, id ASC`)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer rows.Close()
 
@@ -875,6 +1055,42 @@ func (d *DB) backfillFolderSortOrder() error {
 
 	for i, id := range ids {
 		if _, err := tx.Exec(`UPDATE folders SET sort_order = ? WHERE id = ? AND (sort_order IS NULL OR sort_order <= 0)`, i+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (d *DB) backfillCustomFieldSortOrder() error {
+	rows, err := d.sql.Query(`SELECT id FROM custom_fields ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for i, id := range ids {
+		if _, err := tx.Exec(`UPDATE custom_fields SET sort_order = ? WHERE id = ? AND (sort_order IS NULL OR sort_order <= 0)`, i+1, id); err != nil {
 			return err
 		}
 	}

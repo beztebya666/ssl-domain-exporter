@@ -1,20 +1,27 @@
-import { useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft, RefreshCw, Shield, Globe, Link2, Clock,
   CheckCircle, XCircle, AlertTriangle, ExternalLink, ChevronDown, ChevronUp, Pencil, Check, X, Server
 } from 'lucide-react'
-import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
-} from 'recharts'
-import { fetchDomain, fetchHistory, triggerCheck, updateDomain, fetchFolders } from '../api/client'
+import { fetchDomain, fetchHistory, fetchHistoryPage, triggerCheck, updateDomain, fetchFolders, fetchCustomFields } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
 import TagEditor from '../components/TagEditor'
 import MetadataEditor from '../components/MetadataEditor'
+import CustomFieldInputs from '../components/CustomFieldInputs'
+import CollapsiblePanel from '../components/CollapsiblePanel'
+import EmptyState from '../components/EmptyState'
+import Pagination from '../components/Pagination'
+import { DetailSkeleton, Skeleton } from '../components/Skeleton'
+import { useToast } from '../components/ToastProvider'
 import { format, formatDistanceToNow } from 'date-fns'
-import type { Check as CheckType, ChainCert } from '../types'
+import type { AuthMe, BootstrapConfig, ChainCert } from '../types'
 import { metadataSearchText } from '../lib/domainFields'
+import { mergeSchemaAndExtraMetadata, splitMetadataBySchema, visibleMetadataSummary } from '../lib/customFields'
+import { getErrorMessage } from '../lib/utils'
+
+const ExpiryHistoryChart = lazy(() => import('../components/ExpiryHistoryChart'))
 
 function InfoRow({ label, value, mono = false }: { label: string; value?: string | number | null; mono?: boolean }) {
   if (!value && value !== 0) return null
@@ -70,16 +77,17 @@ function ChainCard({ cert, index }: { cert: ChainCert; index: number }) {
   )
 }
 
-const CHART_COLORS = {
-  ssl: '#3b82f6',
-  domain: '#10b981',
+type DomainDetailProps = {
+  me?: AuthMe
+  bootstrap?: BootstrapConfig
 }
 
-export default function DomainDetail() {
+export default function DomainDetail({ me }: DomainDetailProps) {
   const { id } = useParams<{ id: string }>()
   const domainId = Number(id)
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const { showToast } = useToast()
   const [checking, setChecking] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState('')
@@ -92,6 +100,8 @@ export default function DomainDetail() {
   const [editCustomCAPEM, setEditCustomCAPEM] = useState('')
   const [editCheckMode, setEditCheckMode] = useState('full')
   const [editDnsServers, setEditDnsServers] = useState('')
+  const [historyPage, setHistoryPage] = useState(1)
+  const canEdit = me?.can_edit ?? false
 
   const { data: domain, isLoading } = useQuery({
     queryKey: ['domain', domainId],
@@ -99,20 +109,36 @@ export default function DomainDetail() {
     enabled: !!domainId,
   })
 
-  const { data: history = [] } = useQuery({
-    queryKey: ['history', domainId],
-    queryFn: () => fetchHistory(domainId, 100),
+  const { data: historyPreview = [] } = useQuery({
+    queryKey: ['history-preview', domainId],
+    queryFn: () => fetchHistory(domainId, 60),
     enabled: !!domainId,
   })
+  const { data: historyPageData } = useQuery({
+    queryKey: ['history-page', domainId, historyPage],
+    queryFn: () => fetchHistoryPage(domainId, historyPage, 20),
+    enabled: !!domainId,
+    placeholderData: previous => previous,
+  })
   const { data: folders = [] } = useQuery({ queryKey: ['folders'], queryFn: fetchFolders })
+  const { data: customFields = [] } = useQuery({ queryKey: ['custom-fields'], queryFn: () => fetchCustomFields(false) })
+
+  useEffect(() => {
+    setHistoryPage(1)
+  }, [domainId])
 
   const updateMutation = useMutation({
     mutationFn: (data: Parameters<typeof updateDomain>[1]) => updateDomain(domainId, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['domain', domainId] })
       qc.invalidateQueries({ queryKey: ['domains'] })
+      qc.invalidateQueries({ queryKey: ['domains-page'] })
+      qc.invalidateQueries({ queryKey: ['dashboard-domains-page'] })
+      qc.invalidateQueries({ queryKey: ['tags'] })
       setEditing(false)
+      showToast({ tone: 'success', text: 'Domain updated.' })
     },
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to update domain.') }),
   })
 
   const startEdit = () => {
@@ -135,42 +161,59 @@ export default function DomainDetail() {
     try {
       await triggerCheck(domainId)
       qc.invalidateQueries({ queryKey: ['domain', domainId] })
-      qc.invalidateQueries({ queryKey: ['history', domainId] })
+      qc.invalidateQueries({ queryKey: ['history-preview', domainId] })
+      qc.invalidateQueries({ queryKey: ['history-page', domainId] })
       qc.invalidateQueries({ queryKey: ['domains'] })
+      qc.invalidateQueries({ queryKey: ['domains-page'] })
+      qc.invalidateQueries({ queryKey: ['dashboard-domains-page'] })
+      showToast({ tone: 'success', text: 'Check triggered.' })
+    } catch (err) {
+      showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to trigger check.') })
     } finally {
       setChecking(false)
     }
   }
 
   const isSSLOnly = domain?.check_mode === 'ssl_only'
+  const editMetadataSplit = splitMetadataBySchema(editMetadata, customFields)
+  const visibleDetailMetadata = visibleMetadataSummary(domain?.metadata ?? {}, customFields, 'details')
 
   // Build chart data from history (reversed, oldest first)
-  const chartData = [...history].reverse().map(c => ({
+  const chartData = [...historyPreview].reverse().map(c => ({
     time: format(new Date(c.checked_at), 'MM/dd HH:mm'),
     ssl: c.ssl_expiry_days,
     domain: c.registration_check_skipped ? null : c.domain_expiry_days,
   }))
+  const historyItems = historyPageData?.items ?? []
+  const historyTotalPages = Math.max(1, historyPageData?.total_pages ?? 1)
+  const historySafePage = Math.min(historyPage, historyTotalPages)
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-full text-gray-500">
-        <RefreshCw className="animate-spin mr-2" size={20} /> Loading...
-      </div>
-    )
+    return <DetailSkeleton />
   }
 
   if (!domain) {
     return (
       <div className="p-6">
-        <p className="text-gray-400">Domain not found.</p>
-        <button className="btn-ghost mt-3" onClick={() => navigate('/domains')}>
-          <ArrowLeft size={14} /> Back
-        </button>
+        <EmptyState
+          icon={Globe}
+          title="Domain not found"
+          description="The requested inventory record may have been deleted or is no longer visible to your current account."
+          action={
+            <button className="btn-ghost border border-slate-700" onClick={() => navigate('/domains')}>
+              <ArrowLeft size={14} />
+              Back to inventory
+            </button>
+          }
+        />
       </div>
     )
   }
 
   const check = domain.last_check
+  const advisoryOnly = Boolean(check?.overall_status === 'ok' && check.status_reasons?.length)
+  const operationalReasons = (check?.status_reasons ?? []).filter(reason => reason.severity !== 'advisory')
+  const advisoryReasons = (check?.status_reasons ?? []).filter(reason => reason.severity === 'advisory')
 
   return (
     <div className="p-6 space-y-6">
@@ -210,7 +253,12 @@ export default function DomainDetail() {
           ) : (
             <div className="flex items-center gap-3">
               <h1 className="text-xl font-bold text-white">{domain.name}</h1>
-              <StatusBadge status={check?.overall_status ?? 'unknown'} />
+              <StatusBadge status={check?.overall_status ?? 'unknown'} title={check?.primary_reason_text} />
+              {advisoryOnly && (
+                <span className="text-xs text-slate-300 bg-slate-500/10 border border-slate-600/40 px-2 py-0.5 rounded-full" title={check?.primary_reason_text}>
+                  validation notes
+                </span>
+              )}
               {domain.tags.map(tag => (
                 <span key={tag.toLowerCase()} className="text-xs text-blue-300 bg-blue-500/10 px-2 py-0.5 rounded-full">
                   {tag}
@@ -219,9 +267,11 @@ export default function DomainDetail() {
               {domain.check_mode === 'ssl_only' && (
                 <span className="text-xs text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-full">SSL Only</span>
               )}
-              <button className="btn-ghost p-1.5 opacity-60 hover:opacity-100" onClick={startEdit}>
-                <Pencil size={13} />
-              </button>
+              {canEdit && (
+                <button className="btn-ghost p-1.5 opacity-60 hover:opacity-100" onClick={startEdit}>
+                  <Pencil size={13} />
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -229,60 +279,99 @@ export default function DomainDetail() {
           <a href={`https://${domain.name}${domain.port && domain.port !== 443 ? `:${domain.port}` : ''}`} target="_blank" rel="noopener noreferrer" className="btn-ghost">
             <ExternalLink size={14} /> Open
           </a>
-          <button className="btn-primary" onClick={handleCheck} disabled={checking}>
-            <RefreshCw size={14} className={checking ? 'animate-spin' : ''} />
-            {checking ? 'Checking...' : 'Check Now'}
-          </button>
+          {canEdit && (
+            <button className="btn-primary" onClick={handleCheck} disabled={checking}>
+              <RefreshCw size={14} className={checking ? 'animate-spin' : ''} />
+              {checking ? 'Checking...' : 'Check Now'}
+            </button>
+          )}
         </div>
       </div>
 
       {/* Edit extra fields */}
       {editing && (
-        <div className="card grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div className="md:col-span-2">
-            <label className="label">Tags</label>
-            <TagEditor tags={editTags} onChange={setEditTags} />
-          </div>
-          <div className="md:col-span-2">
-            <label className="label">Metadata</label>
-            <MetadataEditor value={editMetadata} onChange={setEditMetadata} />
-          </div>
-          <div>
-            <label className="label">Check interval (seconds)</label>
-            <input className="input" type="number" value={editInterval} onChange={e => setEditInterval(Number(e.target.value))} />
-          </div>
-          <div>
-            <label className="label">Enabled</label>
-            <select className="input" value={editEnabled ? '1' : '0'} onChange={e => setEditEnabled(e.target.value === '1')}>
-              <option value="1">Yes</option>
-              <option value="0">No</option>
-            </select>
-          </div>
-          <div>
-            <label className="label">HTTPS Port</label>
-            <input className="input" type="number" min={1} max={65535} value={editPort} onChange={e => setEditPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))} />
-          </div>
-          <div>
-            <label className="label">Folder</label>
-            <select className="input" value={editFolderValue} onChange={e => setEditFolderValue(e.target.value)}>
-              <option value="">No folder</option>
-              {folders.map(folder => (
-                <option key={folder.id} value={folder.id}>{folder.name}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="label">Check Mode</label>
-            <select className="input" value={editCheckMode} onChange={e => setEditCheckMode(e.target.value)}>
-              <option value="full">Full (SSL + Domain Registration)</option>
-              <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
-            </select>
-          </div>
-          <div>
-            <label className="label">DNS Servers</label>
-            <input className="input" value={editDnsServers} onChange={e => setEditDnsServers(e.target.value)} placeholder="10.0.0.1:53, 10.0.0.2:53" />
-          </div>
-          <div className="md:col-span-4">
+        <div className="card space-y-4">
+          <CollapsiblePanel
+            title="Inventory & ownership"
+            description="Business context, tags, custom fields, and optional free-form metadata."
+            icon={Server}
+            defaultOpen
+            className="border-0 bg-transparent"
+            bodyClassName="px-0 pb-0"
+          >
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div>
+                <label className="label">Tags</label>
+                <TagEditor tags={editTags} onChange={setEditTags} />
+              </div>
+              <div>
+                <label className="label">Metadata</label>
+                <MetadataEditor
+                  value={editMetadataSplit.extraMetadata}
+                  onChange={extraMetadata => setEditMetadata(mergeSchemaAndExtraMetadata(editMetadataSplit.schemaMetadata, extraMetadata))}
+                />
+              </div>
+            </div>
+            <div className="mt-4">
+              <CustomFieldInputs fields={customFields} metadata={editMetadata} onChange={setEditMetadata} />
+            </div>
+          </CollapsiblePanel>
+
+          <CollapsiblePanel
+            title="Monitoring policy"
+            description="Scheduling, inventory placement, endpoint port, and registration lookup mode."
+            icon={Clock}
+            defaultOpen
+            className="border-0 bg-transparent"
+            bodyClassName="px-0 pb-0"
+          >
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <div>
+                <label className="label">Check interval (seconds)</label>
+                <input className="input" type="number" value={editInterval} onChange={e => setEditInterval(Number(e.target.value))} />
+              </div>
+              <div>
+                <label className="label">Enabled</label>
+                <select className="select" value={editEnabled ? '1' : '0'} onChange={e => setEditEnabled(e.target.value === '1')}>
+                  <option value="1">Yes</option>
+                  <option value="0">No</option>
+                </select>
+              </div>
+              <div>
+                <label className="label">HTTPS Port</label>
+                <input className="input" type="number" min={1} max={65535} value={editPort} onChange={e => setEditPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))} />
+              </div>
+              <div>
+                <label className="label">Folder</label>
+                <select className="select" value={editFolderValue} onChange={e => setEditFolderValue(e.target.value)}>
+                  <option value="">No folder</option>
+                  {folders.map(folder => (
+                    <option key={folder.id} value={folder.id}>{folder.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="label">Check Mode</label>
+                <select className="select" value={editCheckMode} onChange={e => setEditCheckMode(e.target.value)}>
+                  <option value="full">Full (SSL + Domain Registration)</option>
+                  <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
+                </select>
+              </div>
+              <div>
+                <label className="label">DNS Servers</label>
+                <input className="input" value={editDnsServers} onChange={e => setEditDnsServers(e.target.value)} placeholder="10.0.0.1:53, 10.0.0.2:53" />
+              </div>
+            </div>
+          </CollapsiblePanel>
+
+          <CollapsiblePanel
+            title="Trust & certificate overrides"
+            description="Optional private trust root used only for this inventory item."
+            icon={Shield}
+            defaultOpen={false}
+            className="border-0 bg-transparent"
+            bodyClassName="px-0 pb-0"
+          >
             <label className="label">Custom Root CA (PEM)</label>
             <textarea
               className="input h-32 resize-y font-mono text-xs"
@@ -290,28 +379,52 @@ export default function DomainDetail() {
               onChange={e => setEditCustomCAPEM(e.target.value)}
               placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
             />
-          </div>
+          </CollapsiblePanel>
         </div>
       )}
 
       {/* Info panels */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="card space-y-0">
-          <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
-            <Server size={15} className="text-cyan-400" /> Inventory Metadata
-          </h3>
-          <InfoRow label="Tags" value={domain.tags.join(', ')} />
-          {Object.keys(domain.metadata ?? {}).length === 0 ? (
-            <div className="text-sm text-gray-500">No metadata configured.</div>
-          ) : (
-            Object.entries(domain.metadata)
-              .sort(([a], [b]) => a.localeCompare(b))
-              .map(([key, value]) => (
-                <InfoRow key={key} label={key} value={value} mono />
-              ))
-          )}
+      {operationalReasons.length > 0 && (
+        <div className="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4">
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={18} className="text-amber-400 mt-0.5" />
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-white">Operational alert</div>
+              <div className="text-sm text-slate-300 mt-1">{check?.primary_reason_text || 'A non-OK condition is active.'}</div>
+              <ul className="mt-3 space-y-2 text-xs text-slate-400">
+                {operationalReasons.map(reason => (
+                  <li key={`${reason.code}-${reason.summary}`} className="rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2">
+                    <span className="font-medium text-slate-200">[{reason.severity.toUpperCase()}]</span> {reason.detail || reason.summary}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
         </div>
+      )}
 
+      {advisoryReasons.length > 0 && (
+        <div className={`rounded-2xl p-4 ${advisoryOnly ? 'border border-slate-700 bg-slate-900/40' : 'border border-slate-700 bg-slate-900/30'}`}>
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={18} className="text-slate-400 mt-0.5" />
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-white">Validation findings</div>
+              <div className="text-sm text-slate-300 mt-1">
+                {advisoryOnly ? 'These findings are advisory-only under the current status policy.' : 'Additional validation findings are available for review.'}
+              </div>
+              <ul className="mt-3 space-y-2 text-xs text-slate-400">
+                {advisoryReasons.map(reason => (
+                  <li key={`${reason.code}-${reason.summary}`} className="rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2">
+                    <span className="font-medium text-slate-300">[{reason.severity.toUpperCase()}]</span> {reason.detail || reason.summary}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-4">
         {/* SSL Panel */}
         <div className="card space-y-0">
           <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
@@ -340,6 +453,33 @@ export default function DomainDetail() {
               />
             </>
           )}
+        </div>
+
+        {/* SSL Chain Panel */}
+        <div className="card space-y-0">
+          <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
+            <Link2 size={15} className="text-purple-400" /> SSL Chain
+          </h3>
+          <div className="flex items-center gap-2 mb-3">
+            {check?.ssl_chain_valid ? (
+              <span className="flex items-center gap-1.5 text-green-400 text-sm">
+                <CheckCircle size={14} /> Valid chain ({check.ssl_chain_length} certs)
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-red-400 text-sm">
+                <XCircle size={14} /> Invalid chain
+              </span>
+            )}
+          </div>
+          {check?.ssl_chain_error && (
+            <p className="text-xs text-yellow-400 mb-2">{check.ssl_chain_error}</p>
+          )}
+          <InfoRow label="Chain length" value={check?.ssl_chain_length} />
+          <InfoRow
+            label="Last check"
+            value={check?.checked_at ? formatDistanceToNow(new Date(check.checked_at), { addSuffix: true }) : undefined}
+          />
+          <InfoRow label="Check duration" value={check?.check_duration_ms != null ? `${check.check_duration_ms}ms` : undefined} />
         </div>
 
         {/* Domain Panel */}
@@ -386,31 +526,25 @@ export default function DomainDetail() {
           )}
         </div>
 
-        {/* SSL Chain Panel */}
+        {/* Inventory Metadata */}
         <div className="card space-y-0">
           <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
-            <Link2 size={15} className="text-purple-400" /> SSL Chain
+            <Server size={15} className="text-cyan-400" /> Inventory Metadata
           </h3>
-          <div className="flex items-center gap-2 mb-3">
-            {check?.ssl_chain_valid ? (
-              <span className="flex items-center gap-1.5 text-green-400 text-sm">
-                <CheckCircle size={14} /> Valid chain ({check.ssl_chain_length} certs)
-              </span>
-            ) : (
-              <span className="flex items-center gap-1.5 text-red-400 text-sm">
-                <XCircle size={14} /> Invalid chain
-              </span>
-            )}
-          </div>
-          {check?.ssl_chain_error && (
-            <p className="text-xs text-yellow-400 mb-2">{check.ssl_chain_error}</p>
+          <InfoRow label="Tags" value={domain.tags.join(', ')} />
+          {visibleDetailMetadata.map(item => (
+            <InfoRow key={item.key} label={item.label} value={item.value} />
+          ))}
+          {Object.keys(domain.metadata ?? {}).length === 0 ? (
+            <div className="text-sm text-gray-500">No metadata configured.</div>
+          ) : (
+            Object.entries(domain.metadata)
+              .filter(([key]) => !visibleDetailMetadata.some(item => item.key === key))
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([key, value]) => (
+                <InfoRow key={key} label={key} value={value} mono />
+              ))
           )}
-          <InfoRow label="Chain length" value={check?.ssl_chain_length} />
-          <InfoRow
-            label="Last check"
-            value={check?.checked_at ? formatDistanceToNow(new Date(check.checked_at), { addSuffix: true }) : undefined}
-          />
-          <InfoRow label="Check duration" value={check?.check_duration_ms != null ? `${check.check_duration_ms}ms` : undefined} />
         </div>
       </div>
 
@@ -420,29 +554,9 @@ export default function DomainDetail() {
           <h3 className="font-semibold text-white mb-4 flex items-center gap-2">
             <Clock size={15} className="text-gray-400" /> Expiry History
           </h3>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-              <XAxis dataKey="time" tick={{ fill: '#6b7280', fontSize: 11 }} />
-              <YAxis tick={{ fill: '#6b7280', fontSize: 11 }} unit="d" />
-              <Tooltip
-                contentStyle={{ backgroundColor: '#111827', border: '1px solid #374151', borderRadius: 8 }}
-                labelStyle={{ color: '#9ca3af' }}
-                itemStyle={{ color: '#e5e7eb' }}
-              />
-              <Legend wrapperStyle={{ color: '#9ca3af', fontSize: 12 }} />
-              <Line
-                type="monotone" dataKey="ssl" name="SSL expiry (days)"
-                stroke={CHART_COLORS.ssl} strokeWidth={2} dot={false} connectNulls
-              />
-              {!isSSLOnly && (
-                <Line
-                  type="monotone" dataKey="domain" name="Domain expiry (days)"
-                  stroke={CHART_COLORS.domain} strokeWidth={2} dot={false} connectNulls
-                />
-              )}
-            </LineChart>
-          </ResponsiveContainer>
+          <Suspense fallback={<Skeleton className="h-56 w-full" />}>
+            <ExpiryHistoryChart data={chartData} showDomain={!isSSLOnly} />
+          </Suspense>
         </div>
       )}
 
@@ -512,7 +626,7 @@ export default function DomainDetail() {
       )}
 
       {/* Check history table */}
-      {history.length > 0 && (
+      {historyItems.length > 0 && (
         <div className="card">
           <h3 className="font-semibold text-white mb-4 flex items-center gap-2">
             <Clock size={15} className="text-gray-400" /> Check History
@@ -527,16 +641,17 @@ export default function DomainDetail() {
                   <th className="pb-2 font-medium">Domain Expiry</th>
                   <th className="pb-2 font-medium">Chain</th>
                   <th className="pb-2 font-medium">Duration</th>
+                  <th className="pb-2 font-medium">Reason</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800/50">
-                {history.map(c => (
+                {historyItems.map(c => (
                   <tr key={c.id} className="hover:bg-gray-800/30">
                     <td className="py-2 text-gray-400">
                       {format(new Date(c.checked_at), 'yyyy-MM-dd HH:mm')}
                     </td>
                     <td className="py-2">
-                      <StatusBadge status={c.overall_status} />
+                      <StatusBadge status={c.overall_status} title={c.primary_reason_text} />
                     </td>
                     <td className="py-2 text-gray-300">
                       {c.ssl_expiry_days != null ? `${c.ssl_expiry_days}d` : '-'}
@@ -554,11 +669,18 @@ export default function DomainDetail() {
                       )}
                     </td>
                     <td className="py-2 text-gray-500">{c.check_duration_ms}ms</td>
+                    <td className="py-2 text-gray-400 max-w-[22rem]">{c.primary_reason_text || '-'}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+          <Pagination
+            page={historySafePage}
+            totalPages={historyTotalPages}
+            onPageChange={setHistoryPage}
+            summary={`Showing ${(historySafePage - 1) * (historyPageData?.page_size ?? 20) + 1}-${Math.min(historySafePage * (historyPageData?.page_size ?? 20), historyPageData?.total ?? historyItems.length)} of ${historyPageData?.total ?? historyItems.length} checks`}
+          />
         </div>
       )}
     </div>

@@ -37,7 +37,7 @@ export default function ExpiryBar({ days, label, warningDays = 30, criticalDays 
           'font-medium',
           days <= criticalDays ? 'text-red-400' : days <= warningDays ? 'text-yellow-400' : 'text-green-400'
         )}>
-          {days < 0 ? 'Expired' : `${days}d`}
+          {days < 0 ? `Expired ${Math.abs(days)}d ago` : `${days}d`}
         </span>
       </div>
       <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">

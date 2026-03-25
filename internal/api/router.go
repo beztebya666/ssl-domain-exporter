@@ -31,7 +31,7 @@ func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched 
 		AllowCredentials: true,
 	}))
 
-	r.Use(AuthMiddleware(cfg))
+	r.Use(AuthMiddleware(cfg, database))
 
 	h := NewHandler(cfg, database, chk, sched, m)
 	distDir := resolveFrontendDistDir()
@@ -47,28 +47,58 @@ func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched 
 
 	api := r.Group("/api")
 	{
-		api.GET("/summary", h.GetSummary)
+		api.GET("/bootstrap", h.GetBootstrap)
+		api.GET("/me", h.GetMe)
+		api.POST("/session/login", h.LoginSession)
+		api.POST("/session/logout", h.LogoutSession)
+	}
 
-		api.GET("/config", h.GetConfig)
-		api.PUT("/config", h.UpdateConfig)
-		api.GET("/settings", h.GetSettings)
-		api.PUT("/settings", h.UpdateSettings)
+	view := api.Group("/")
+	view.Use(RequireView(cfg))
+	{
+		view.GET("/summary", h.GetSummary)
+		view.GET("/timeline", h.GetTimeline)
+		view.GET("/domains", h.ListDomains)
+		view.GET("/domains/search", h.SearchDomains)
+		view.GET("/domains/export.csv", h.ExportDomainsCSV)
+		view.GET("/domains/:id", h.GetDomain)
+		view.GET("/domains/:id/history", h.GetHistory)
+		view.GET("/folders", h.ListFolders)
+		view.GET("/tags", h.ListTags)
+		view.GET("/custom-fields", h.ListCustomFields)
+	}
 
-		api.GET("/domains", h.ListDomains)
-		api.POST("/domains", h.CreateDomain)
-		api.POST("/domains/import", h.ImportDomains)
-		api.POST("/domains/reorder", h.ReorderDomains)
-		api.GET("/domains/export.csv", h.ExportDomainsCSV)
-		api.GET("/domains/:id", h.GetDomain)
-		api.PUT("/domains/:id", h.UpdateDomain)
-		api.DELETE("/domains/:id", h.DeleteDomain)
-		api.POST("/domains/:id/check", h.TriggerCheck)
-		api.GET("/domains/:id/history", h.GetHistory)
+	editor := api.Group("/")
+	editor.Use(RequireEditor(cfg))
+	{
+		editor.POST("/domains", h.CreateDomain)
+		editor.POST("/domains/import", h.ImportDomains)
+		editor.POST("/domains/reorder", h.ReorderDomains)
+		editor.PUT("/domains/:id", h.UpdateDomain)
+		editor.DELETE("/domains/:id", h.DeleteDomain)
+		editor.POST("/domains/:id/check", h.TriggerCheck)
 
-		api.GET("/folders", h.ListFolders)
-		api.POST("/folders", h.CreateFolder)
-		api.PUT("/folders/:id", h.UpdateFolder)
-		api.DELETE("/folders/:id", h.DeleteFolder)
+		editor.POST("/folders", h.CreateFolder)
+		editor.PUT("/folders/:id", h.UpdateFolder)
+		editor.DELETE("/folders/:id", h.DeleteFolder)
+	}
+
+	admin := api.Group("/")
+	admin.Use(RequireAdmin(cfg))
+	{
+		admin.GET("/config", h.GetConfig)
+		admin.PUT("/config", h.UpdateConfig)
+		admin.POST("/custom-fields", h.CreateCustomField)
+		admin.PUT("/custom-fields/:id", h.UpdateCustomField)
+		admin.DELETE("/custom-fields/:id", h.DeleteCustomField)
+		admin.GET("/notifications/status", h.GetNotificationStatus)
+		admin.POST("/notifications/test", h.TestNotifications)
+		admin.GET("/settings", h.GetSettings)
+		admin.PUT("/settings", h.UpdateSettings)
+		admin.GET("/users", h.ListUsers)
+		admin.POST("/users", h.CreateUser)
+		admin.PUT("/users/:id", h.UpdateUser)
+		admin.DELETE("/users/:id", h.DeleteUser)
 	}
 
 	r.Static("/assets", filepath.Join(distDir, "assets"))

@@ -59,9 +59,19 @@ export interface Check {
   registration_check_skipped: boolean
   registration_skip_reason: string
   dns_server_used: string
+  primary_reason_code: string
+  primary_reason_text: string
+  status_reasons: StatusReason[]
 
   overall_status: 'ok' | 'warning' | 'critical' | 'error' | 'unknown'
   check_duration_ms: number
+}
+
+export interface StatusReason {
+  code: string
+  severity: 'advisory' | 'warning' | 'critical' | 'error'
+  summary: string
+  detail?: string
 }
 
 export interface Domain {
@@ -130,9 +140,114 @@ export interface DomainImportRequest {
 export interface Folder {
   id: number
   name: string
+  domain_count: number
   sort_order: number
   created_at: string
   updated_at: string
+}
+
+export interface CustomFieldOption {
+  id?: number
+  field_id?: number
+  value: string
+  label: string
+  sort_order?: number
+}
+
+export interface CustomField {
+  id: number
+  key: string
+  label: string
+  type: 'text' | 'textarea' | 'email' | 'url' | 'date' | 'select'
+  required: boolean
+  placeholder: string
+  help_text: string
+  sort_order: number
+  visible_in_table: boolean
+  visible_in_details: boolean
+  visible_in_export: boolean
+  filterable: boolean
+  enabled: boolean
+  options: CustomFieldOption[]
+  created_at: string
+  updated_at: string
+}
+
+export interface CustomFieldWritePayload {
+  key: string
+  label: string
+  type: CustomField['type']
+  required: boolean
+  placeholder: string
+  help_text: string
+  sort_order: number
+  visible_in_table: boolean
+  visible_in_details: boolean
+  visible_in_export: boolean
+  filterable: boolean
+  enabled: boolean
+  options: CustomFieldOption[]
+}
+
+export interface DomainListParams {
+  search?: string
+  status?: string
+  tag?: string
+  folder_id?: number | string
+  metadata_filters?: Record<string, string>
+  ssl_expiry_lte?: number
+  domain_expiry_lte?: number
+  sort_by?: 'custom' | 'name' | 'status' | 'ssl_expiry' | 'domain_expiry' | 'last_check' | 'created_at'
+  sort_dir?: 'asc' | 'desc'
+  page?: number
+  page_size?: number
+}
+
+export interface DomainListResponse {
+  items: Domain[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+  sort_by: string
+  sort_dir: string
+}
+
+export interface CheckHistoryPage {
+  items: Check[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+}
+
+export interface TimelineEntry {
+  domain_id: number
+  name: string
+  kind: 'ssl' | 'domain'
+  days: number
+  issuer?: string
+}
+
+export interface TimelinePage {
+  items: TimelineEntry[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+}
+
+export interface TimelineSummary {
+  ssl_critical: number
+  ssl_warning: number
+  domain_critical: number
+  domain_warning: number
+}
+
+export interface TimelineResponse {
+  summary: TimelineSummary
+  ssl: TimelinePage
+  domain: TimelinePage
 }
 
 export interface Summary {
@@ -161,6 +276,9 @@ export interface AppConfig {
     protect_api: boolean
     protect_metrics: boolean
     protect_ui: boolean
+    session_ttl: string
+    cookie_name: string
+    cookie_secure: boolean
   }
   checker: {
     interval: string
@@ -186,7 +304,19 @@ export interface AppConfig {
     ssl_expiry_warning_days: number
     ssl_expiry_critical_days: number
   }
+  status_policy: {
+    badge_on_invalid_chain: boolean
+    badge_on_self_signed: boolean
+    badge_on_http_probe_error: boolean
+    badge_on_http_client_error: boolean
+    badge_on_cipher_warning: boolean
+    badge_on_ocsp_unknown: boolean
+    badge_on_crl_unknown: boolean
+    badge_on_caa_missing: boolean
+    badge_on_domain_lookup_error: boolean
+  }
   notifications: {
+    timeout: string
     webhook: {
       enabled: boolean
       url: string
@@ -199,6 +329,20 @@ export interface AppConfig {
       chat_id: string
       on_critical: boolean
       on_warning: boolean
+    }
+    email: {
+      enabled: boolean
+      host: string
+      port: number
+      username: string
+      password: string
+      from: string
+      to: string[]
+      mode: 'starttls' | 'tls' | 'none'
+      on_critical: boolean
+      on_warning: boolean
+      subject_prefix: string
+      insecure_skip_verify: boolean
     }
   }
   dns: {
@@ -218,4 +362,66 @@ export interface AppConfig {
   logging: {
     json: boolean
   }
+}
+
+export interface BootstrapConfig {
+  auth: {
+    enabled: boolean
+    public_ui: boolean
+    anonymous_read_only: boolean
+    mode: 'basic' | 'api_key' | 'both'
+  }
+  prometheus: {
+    enabled: boolean
+    path: string
+    public: boolean
+  }
+  features: AppConfig['features']
+  alerts: AppConfig['alerts']
+  domains: {
+    default_check_mode: string
+  }
+}
+
+export interface AuthMe {
+  authenticated: boolean
+  username?: string
+  role: 'anonymous' | 'viewer' | 'editor' | 'admin'
+  source: string
+  can_view: boolean
+  can_edit: boolean
+  can_admin: boolean
+  public_ui: boolean
+}
+
+export interface NotificationDeliveryStatus {
+  channel: 'webhook' | 'telegram' | 'email'
+  enabled: boolean
+  last_attempt_at?: string | null
+  last_success_at?: string | null
+  last_error?: string
+}
+
+export interface NotificationTestResult {
+  channel: 'webhook' | 'telegram' | 'email'
+  enabled: boolean
+  success: boolean
+  error?: string
+}
+
+export interface UserAccount {
+  id: number
+  username: string
+  role: 'viewer' | 'editor' | 'admin'
+  enabled: boolean
+  last_login_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface UserWritePayload {
+  username: string
+  role: 'viewer' | 'editor' | 'admin'
+  enabled?: boolean
+  password?: string
 }

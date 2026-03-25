@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
 import { normalizeMetadata } from '../lib/domainFields'
 
@@ -35,10 +35,22 @@ function metadataFromRows(rows: MetadataRow[]): Record<string, string> {
 export default function MetadataEditor({ value, onChange }: Props) {
   const [rows, setRows] = useState<MetadataRow[]>(() => rowsFromMetadata(value))
   const nextID = useRef(0)
+  const lastSyncedValue = useRef(JSON.stringify(normalizeMetadata(value)))
+
+  useEffect(() => {
+    const serialized = JSON.stringify(normalizeMetadata(value))
+    if (serialized === lastSyncedValue.current) {
+      return
+    }
+    lastSyncedValue.current = serialized
+    setRows(rowsFromMetadata(value))
+  }, [value])
 
   const updateRows = (nextRows: MetadataRow[]) => {
     setRows(nextRows)
-    onChange(metadataFromRows(nextRows))
+    const nextValue = metadataFromRows(nextRows)
+    lastSyncedValue.current = JSON.stringify(nextValue)
+    onChange(nextValue)
   }
 
   const addRow = () => {

@@ -6,3 +6,10 @@ frontend/dist/
 *.exe
 .env
 .claude/settings.local.json
+.claude/
+.vscode/
+.idea/
+.DS_Store
+*.log
+coverage.out
+dist/

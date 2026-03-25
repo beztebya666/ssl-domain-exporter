@@ -67,6 +67,11 @@ func (h *Handler) CreateDomain(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	in.Metadata, err = h.validateDomainMetadata(in.Metadata)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	dom, err := h.db.CreateDomain(in.Name, in.Tags, in.Metadata, in.CustomCAPEM, in.CheckMode, in.DNSServers, in.Interval, in.Port, in.FolderID)
 	if err != nil {
@@ -161,6 +166,11 @@ func (h *Handler) UpdateDomain(c *gin.Context) {
 	metadata := cloneMetadata(current.Metadata)
 	if in.HasMetadata {
 		metadata = cloneMetadata(in.Metadata)
+	}
+	metadata, err = h.validateDomainMetadata(metadata)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 	customCAPEM := current.CustomCAPEM
 	if in.HasCustomCAPEM {
@@ -291,6 +301,14 @@ func (h *Handler) ImportDomains(c *gin.Context) {
 		current := existingByName[item.Name]
 		if current == nil {
 			preview := buildImportedDomain(cfg, nil, item)
+			preview.Metadata, err = h.validateDomainMetadata(preview.Metadata)
+			if err != nil {
+				result.Action = "failed"
+				result.Error = err.Error()
+				resp.Summary.Failed++
+				resp.Results = append(resp.Results, result)
+				continue
+			}
 			if req.DryRun {
 				result.Action = "create"
 				result.Domain = preview
@@ -347,6 +365,14 @@ func (h *Handler) ImportDomains(c *gin.Context) {
 		}
 
 		preview := buildImportedDomain(cfg, current, item)
+		preview.Metadata, err = h.validateDomainMetadata(preview.Metadata)
+		if err != nil {
+			result.Action = "failed"
+			result.Error = err.Error()
+			resp.Summary.Failed++
+			resp.Results = append(resp.Results, result)
+			continue
+		}
 		if req.DryRun {
 			result.Action = "update"
 			result.Domain = preview
@@ -462,6 +488,19 @@ func (h *Handler) ListFolders(c *gin.Context) {
 	c.JSON(http.StatusOK, folders)
 }
 
+// GET /api/tags
+func (h *Handler) ListTags(c *gin.Context) {
+	tags, err := h.db.ListTags()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	c.JSON(http.StatusOK, tags)
+}
+
 // POST /api/folders
 func (h *Handler) CreateFolder(c *gin.Context) {
 	var req struct {
@@ -549,6 +588,54 @@ func (h *Handler) GetHistory(c *gin.Context) {
 		return
 	}
 
+	pageStr := strings.TrimSpace(c.Query("page"))
+	pageSizeStr := strings.TrimSpace(c.Query("page_size"))
+	if pageStr != "" || pageSizeStr != "" {
+		page, _ := strconv.Atoi(pageStr)
+		pageSize, _ := strconv.Atoi(pageSizeStr)
+		if page < 1 {
+			page = 1
+		}
+		if pageSize <= 0 {
+			pageSize = 20
+		}
+		if pageSize > 100 {
+			pageSize = 100
+		}
+
+		total, err := h.db.CountCheckHistory(id)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		totalPages := 1
+		if total > 0 {
+			totalPages = (total + pageSize - 1) / pageSize
+		}
+		if page > totalPages {
+			page = totalPages
+		}
+		offset := (page - 1) * pageSize
+
+		checks, err := h.db.GetCheckHistoryPage(id, pageSize, offset)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if checks == nil {
+			checks = []db.Check{}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"items":       checks,
+			"total":       total,
+			"page":        page,
+			"page_size":   pageSize,
+			"total_pages": totalPages,
+		})
+		return
+	}
+
 	limitStr := c.DefaultQuery("limit", "50")
 	limit, _ := strconv.Atoi(limitStr)
 
@@ -572,12 +659,23 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 		return
 	}
 
-	domains, err := h.db.GetDomains()
+	query, err := buildDomainListQuery(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	domains, err := h.db.ListDomainsForExport(query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	lastChecks, _ := h.db.GetAllLastChecks()
+	customFields, err := h.db.ListCustomFields(false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	exportFields := visibleExportCustomFields(customFields)
 
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", `attachment; filename="domains_export.csv"`)
@@ -589,6 +687,9 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 		"id", "domain", "port", "folder_id", "tags", "metadata", "custom_ca", "check_mode", "dns_servers", "enabled", "status",
 		"ssl_expiry_days", "domain_expiry_days", "registration_check_skipped",
 		"http_status_code", "http_response_time_ms", "http_redirects_https", "http_hsts_enabled", "checked_at",
+	}
+	for _, field := range exportFields {
+		header = append(header, field.Key)
 	}
 	_ = w.Write(header)
 
@@ -617,7 +718,7 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 		if d.FolderID != nil {
 			row[3] = strconv.FormatInt(*d.FolderID, 10)
 		}
-		if chk, ok := lastChecks[d.ID]; ok {
+		if chk := d.LastCheck; chk != nil {
 			row[10] = chk.OverallStatus
 			if chk.SSLExpiryDays != nil {
 				row[11] = strconv.Itoa(*chk.SSLExpiryDays)
@@ -636,6 +737,9 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 			row[16] = strconv.FormatBool(chk.HTTPRedirectsHTTPS)
 			row[17] = strconv.FormatBool(chk.HTTPHSTSEnabled)
 			row[18] = chk.CheckedAt.Format("2006-01-02 15:04:05")
+		}
+		for _, field := range exportFields {
+			row = append(row, d.Metadata[field.Key])
 		}
 		_ = w.Write(row)
 	}
@@ -667,6 +771,32 @@ func (h *Handler) UpdateConfig(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, h.cfg.Snapshot())
+}
+
+// GET /api/notifications/status
+func (h *Handler) GetNotificationStatus(c *gin.Context) {
+	if h.checker == nil {
+		c.JSON(http.StatusOK, []checker.DeliveryStatus{})
+		return
+	}
+	statuses := h.checker.NotificationStatuses()
+	if statuses == nil {
+		statuses = []checker.DeliveryStatus{}
+	}
+	c.JSON(http.StatusOK, statuses)
+}
+
+// POST /api/notifications/test
+func (h *Handler) TestNotifications(c *gin.Context) {
+	if h.checker == nil {
+		c.JSON(http.StatusOK, []checker.TestResult{})
+		return
+	}
+	results := h.checker.SendTestNotifications()
+	if results == nil {
+		results = []checker.TestResult{}
+	}
+	c.JSON(http.StatusOK, results)
 }
 
 // GET /api/settings (compatibility endpoint)
@@ -706,6 +836,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		"dns_servers":                     strings.Join(cfg.DNS.Servers, ","),
 		"dns_use_system_dns":              cfg.DNS.UseSystemDNS,
 		"dns_timeout":                     cfg.DNS.Timeout,
+		"notifications_timeout":           cfg.Notifications.Timeout,
 	})
 }
 
@@ -729,7 +860,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				cfg.Checker.ConcurrentChecks = n
 			}
 		case "prometheus_enabled":
-			cfg.Prometheus.Enabled = parseBool(v)
+			cfg.Prometheus.Enabled = config.ParseBool(v)
 		case "prometheus_path":
 			cfg.Prometheus.Path = v
 		case "alert_domain_expiry_warning":
@@ -749,43 +880,43 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				cfg.Alerts.SSLExpiryCriticalDays = n
 			}
 		case "notifications_enabled":
-			cfg.Features.Notifications = parseBool(v)
+			cfg.Features.Notifications = config.ParseBool(v)
 		case "notifications_webhook_url":
 			cfg.Notifications.Webhook.URL = v
 		case "webhook_on_critical":
-			cfg.Notifications.Webhook.OnCritical = parseBool(v)
+			cfg.Notifications.Webhook.OnCritical = config.ParseBool(v)
 		case "webhook_on_warning":
-			cfg.Notifications.Webhook.OnWarning = parseBool(v)
+			cfg.Notifications.Webhook.OnWarning = config.ParseBool(v)
 		case "telegram_enabled":
-			cfg.Notifications.Telegram.Enabled = parseBool(v)
+			cfg.Notifications.Telegram.Enabled = config.ParseBool(v)
 		case "telegram_bot_token":
 			cfg.Notifications.Telegram.BotToken = v
 		case "telegram_chat_id":
 			cfg.Notifications.Telegram.ChatID = v
 		case "telegram_on_critical":
-			cfg.Notifications.Telegram.OnCritical = parseBool(v)
+			cfg.Notifications.Telegram.OnCritical = config.ParseBool(v)
 		case "telegram_on_warning":
-			cfg.Notifications.Telegram.OnWarning = parseBool(v)
+			cfg.Notifications.Telegram.OnWarning = config.ParseBool(v)
 		case "feature_http_check":
-			cfg.Features.HTTPCheck = parseBool(v)
+			cfg.Features.HTTPCheck = config.ParseBool(v)
 		case "feature_cipher_check":
-			cfg.Features.CipherCheck = parseBool(v)
+			cfg.Features.CipherCheck = config.ParseBool(v)
 		case "feature_ocsp_check":
-			cfg.Features.OCSPCheck = parseBool(v)
+			cfg.Features.OCSPCheck = config.ParseBool(v)
 		case "feature_crl_check":
-			cfg.Features.CRLCheck = parseBool(v)
+			cfg.Features.CRLCheck = config.ParseBool(v)
 		case "feature_caa_check":
-			cfg.Features.CAACheck = parseBool(v)
+			cfg.Features.CAACheck = config.ParseBool(v)
 		case "feature_csv_export":
-			cfg.Features.CSVExport = parseBool(v)
+			cfg.Features.CSVExport = config.ParseBool(v)
 		case "feature_timeline_view":
-			cfg.Features.TimelineView = parseBool(v)
+			cfg.Features.TimelineView = config.ParseBool(v)
 		case "feature_dashboard_tag_filter":
-			cfg.Features.DashboardTagFilter = parseBool(v)
+			cfg.Features.DashboardTagFilter = config.ParseBool(v)
 		case "feature_structured_logs":
-			cfg.Features.StructuredLogs = parseBool(v)
+			cfg.Features.StructuredLogs = config.ParseBool(v)
 		case "domain_subdomain_fallback":
-			cfg.Domains.SubdomainFallback = parseBool(v)
+			cfg.Domains.SubdomainFallback = config.ParseBool(v)
 		case "domain_subdomain_fallback_depth":
 			if n, err := strconv.Atoi(v); err == nil {
 				cfg.Domains.FallbackDepth = n
@@ -802,9 +933,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			}
 			cfg.DNS.Servers = servers
 		case "dns_use_system_dns":
-			cfg.DNS.UseSystemDNS = parseBool(v)
+			cfg.DNS.UseSystemDNS = config.ParseBool(v)
 		case "dns_timeout":
 			cfg.DNS.Timeout = v
+		case "notifications_timeout":
+			cfg.Notifications.Timeout = v
 		}
 	}
 
@@ -863,11 +996,6 @@ func normalizeDomain(name string) string {
 	return name
 }
 
-func parseBool(v string) bool {
-	v = strings.ToLower(strings.TrimSpace(v))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
-}
-
 func isDomainAlreadyExistsErr(err error) bool {
 	if err == nil {
 		return false
@@ -888,11 +1016,11 @@ func (h *Handler) refreshTotalDomainsMetric() {
 	if h.metrics == nil {
 		return
 	}
-	domains, err := h.db.GetDomains()
+	count, err := h.db.CountDomains()
 	if err != nil {
 		return
 	}
-	h.metrics.SetTotalDomains(len(domains))
+	h.metrics.SetTotalDomains(count)
 }
 
 func buildImportedDomain(cfg *config.Config, current *db.Domain, in domainInput) *db.Domain {

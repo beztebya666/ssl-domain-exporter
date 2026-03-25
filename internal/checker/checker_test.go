@@ -151,6 +151,54 @@ func TestComputeStatus_CipherGradeF(t *testing.T) {
 	}
 }
 
+func TestEvaluateStatus_InvalidChainCanStayAdvisoryOnly(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.StatusPolicy.BadgeOnInvalidChain = false
+
+	check := &db.Check{
+		SSLExpiryDays: intPtr(120),
+		SSLChainValid: false,
+		SSLChainError: "x509: certificate signed by unknown authority",
+	}
+
+	assessment := evaluateStatus(check, cfg)
+	if assessment.Status != "ok" {
+		t.Fatalf("expected ok when invalid chain is advisory-only, got %s", assessment.Status)
+	}
+	if assessment.PrimaryReasonCode != "ssl_chain_invalid" {
+		t.Fatalf("expected ssl_chain_invalid primary reason, got %s", assessment.PrimaryReasonCode)
+	}
+	if len(assessment.Reasons) != 1 || assessment.Reasons[0].Severity != "advisory" {
+		t.Fatalf("expected one advisory reason, got %+v", assessment.Reasons)
+	}
+}
+
+func TestEvaluateStatus_HTTPClientErrorCanStayAdvisoryOnly(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.Features.HTTPCheck = true
+	cfg.StatusPolicy.BadgeOnHTTPClientError = false
+
+	check := &db.Check{
+		SSLExpiryDays:    intPtr(120),
+		SSLChainValid:    true,
+		HTTPStatusCode:   404,
+		HTTPFinalURL:     "https://example.com/missing",
+		SSLCheckError:    "",
+		DomainCheckError: "",
+	}
+
+	assessment := evaluateStatus(check, cfg)
+	if assessment.Status != "ok" {
+		t.Fatalf("expected ok when HTTP 4xx is advisory-only, got %s", assessment.Status)
+	}
+	if assessment.PrimaryReasonCode != "http_status_warning" {
+		t.Fatalf("expected http_status_warning primary reason, got %s", assessment.PrimaryReasonCode)
+	}
+	if len(assessment.Reasons) == 0 || assessment.Reasons[0].Severity != "advisory" {
+		t.Fatalf("expected advisory reason, got %+v", assessment.Reasons)
+	}
+}
+
 func TestComputeStatus_OCSPRevoked(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.Features.OCSPCheck = true

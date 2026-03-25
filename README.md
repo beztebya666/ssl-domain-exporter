@@ -2,11 +2,13 @@
 
 ![image](/docs/screenshots/main_screen.png)
 
-Current version: `v1.2.0`
+> Screenshot note: the exact interface can vary slightly by theme, viewport, and release build. The current UI includes responsive navigation, toast feedback, guided notification setup, and status-focused dashboard sections.
+
+Current version: `v1.3.0`
 
 dockerhub: https://hub.docker.com/r/beztebya666/ssl-domain-exporter
 
-SSL Domain Exporter is a self-hosted service for monitoring SSL certificates (+chain validation), domain registration expiry dates, and DNS health, with a web UI, REST API, SQLite storage, and Prometheus metrics. Designed for enterprise environments including air-gapped networks and internal domains.
+SSL Domain Exporter is a self-hosted service for monitoring SSL certificates (+chain validation), domain registration expiry dates, and DNS-related validation checks, with a web UI, REST API, SQLite storage, and Prometheus metrics. Designed for enterprise environments including air-gapped networks and internal domains.
 
 ## Features
 
@@ -19,9 +21,14 @@ SSL Domain Exporter is a self-hosted service for monitoring SSL certificates (+c
 - **Enterprise import:** line import and JSON batch import with `create_only`, `upsert`, `dry_run`, and optional immediate checks.
 - **Optional checks:** HTTP/HTTPS, cipher grade, OCSP, CRL, CAA.
 - **Per-domain settings:** HTTPS port, check interval, tags, metadata, folders, custom root CA (PEM), check mode, DNS servers.
-- **UI:** Dashboard, domain list, domain details with history, Settings, Timeline (feature flag).
+- **UI:** responsive dashboard, domain list, domain details with history, Settings, Timeline (feature flag), mobile sidebar navigation, server-side sorting/filtering, pagination, large-list virtualization, and toast-based feedback.
 - **CSV export** (feature flag).
-- **Webhook and Telegram notifications** on status change to `warning` or `critical`.
+- **Notifications:** Webhook, Telegram, and Email on status change to `warning` or `critical`.
+- **Notification setup wizard:** guided SMTP / webhook / Telegram setup with live channel tests and delivery status.
+- **Access model:** public read-only UI, local session-based users with `viewer` / `editor` / `admin` roles, plus legacy Basic/Auth API key compatibility.
+- **Status clarity:** each check stores an explainable primary reason plus detailed findings, and admins can decide which findings elevate the main list/dashboard badge versus remaining advisory-only.
+- **Dashboard signal separation:** operational alerts, expiry watchlist, and validation findings are shown as separate information groups.
+- **Theme-aware UX:** dark/light themes, custom status styling, responsive navigation, and reduced-motion friendly transitions.
 - **Prometheus endpoint** with registration-aware metrics and ready-to-use Grafana/Alertmanager files.
 - **Cross-platform:** Linux, macOS, and Windows DNS discovery support.
 
@@ -80,16 +87,42 @@ Behavior:
 - The API accepts legacy tag strings and modern tag arrays.
 - Metadata keys are normalized to lowercase and may use letters, numbers, dot, dash, and underscore.
 - Empty tag or metadata values are ignored.
+- Metadata remains backwards-compatible even when you later introduce custom inventory field schemas.
 
 Recommended usage:
 
 - Use tags for low-cardinality grouping and filtering.
-- Use metadata for richer inventory context that should not become a Prometheus label automatically.
+- Use metadata for richer inventory context. Metadata is also exported to Prometheus through a dedicated info metric instead of being copied onto every operational gauge.
 
 Examples:
 
 - Tags: `["prod", "api", "internal"]`
 - Metadata: `{"owner":"platform-team","zone":"corp","change_id":"CHG-042"}`
+
+## Custom Inventory Fields
+
+Enterprise environments often need optional but standardized inventory fields such as `owner_email`, `zone`, `service_tier`, or `change_id`.
+
+This release adds a schema-driven custom field layer on top of `metadata`:
+
+- Configure fields in **Settings -> Custom Inventory Fields**
+- Supported types: `text`, `textarea`, `email`, `url`, `date`, `select`
+- Per-field controls:
+  - required / optional
+  - enabled / disabled
+  - visible in table
+  - visible in details
+  - visible in export
+  - filterable
+- Dynamic forms automatically render these fields in add/edit screens
+- Filterable fields appear as first-class filters on Dashboard and Domains
+- Exportable fields become dedicated CSV columns
+
+Design notes:
+
+- Field values are still stored in the existing `metadata` JSON, so upgrades stay backwards-compatible.
+- Unknown metadata keys are still allowed and remain available as extra metadata.
+- Field keys are intentionally immutable after creation to avoid silently orphaning existing inventory values.
 
 ## Import and IaC
 
@@ -109,6 +142,10 @@ The web UI supports:
 - line import (`one domain per line`)
 - JSON import
 - shared defaults for tags, metadata, check mode, DNS, interval, folder, custom CA, and enabled state
+- server-side filtering, sorting, and pagination
+- `SSL <= X days` and `Domain <= X days` inventory filters
+- CSV export that respects current filters
+- virtualized rendering for large domain lists
 
 ## DNS Resolution
 
@@ -137,6 +174,20 @@ The effective DNS server used is recorded in each check as `dns_server_used` for
 - `warning`: upcoming expiry, invalid chain, HTTP 4xx, `cipher grade=C`, OCSP/CRL unknown, etc.
 - `critical`: critical expiry, HTTP 5xx, `cipher grade=F`, revoked in OCSP/CRL.
 - `error`: both SSL and domain checks failed at the same time.
+
+Every stored check also includes:
+
+- `primary_reason_code`
+- `primary_reason_text`
+- `status_reasons[]`
+
+By default, findings such as invalid chain, missing CAA, or OCSP unknown can elevate the main badge. In enterprise environments you can tune `status_policy` so some findings stay visible in the domain details/history as `advisory` notes without turning the main dashboard/list badge yellow or red.
+
+Recommended mental model:
+
+- `Operational Alerts`: findings that should affect the main badge and alerting behavior
+- `Expiry Watchlist`: SSL/domain expirations inside the configured thresholds
+- `Validation Findings`: advisory-only technical findings that remain visible for follow-up
 
 ## Tech Stack
 
@@ -210,6 +261,22 @@ Health check:
 curl http://localhost:8080/health
 ```
 
+## Release Verification
+
+Before cutting a release, run the automated release checks:
+
+```bash
+make release-check
+```
+
+Then complete the short manual checklist in [docs/release-checklist.md](docs/release-checklist.md), especially for:
+
+- dark/light theme verification
+- responsive/mobile navigation
+- `ssl_only` and `full` workflows
+- notification channel tests
+- filtered export and pagination flows
+
 ## Configuration
 
 Main file: `config.yaml`.
@@ -253,11 +320,46 @@ auth:
   protect_api: true
   protect_metrics: true
   protect_ui: false
+  session_ttl: "24h"
+  cookie_name: "ssl_domain_exporter_session"
+  cookie_secure: false
+
+status_policy:
+  badge_on_invalid_chain: true
+  badge_on_self_signed: true
+  badge_on_http_probe_error: true
+  badge_on_http_client_error: true
+  badge_on_cipher_warning: true
+  badge_on_ocsp_unknown: true
+  badge_on_crl_unknown: true
+  badge_on_caa_missing: true
+  badge_on_domain_lookup_error: true
+
+notifications:
+  timeout: "15s"
+  email:
+    enabled: false
+    host: "smtp.example.local"
+    port: 587
+    mode: "starttls"
+    username: "alerts@example.local"
+    password: "change-me"
+    from: "alerts@example.local"
+    to: ["ops@example.local", "noc@example.local"]
+    on_critical: true
+    on_warning: true
+    subject_prefix: "[SSL Domain Exporter]"
 
 prometheus:
   enabled: true
   path: "/metrics"
 ```
+
+`status_policy` can also be tuned quickly from the UI with presets:
+
+- `Strict`
+- `Balanced`
+- `Expiry-focused`
 
 ## Authentication
 
@@ -273,13 +375,27 @@ Behavior is controlled by:
 - `auth.protect_metrics`
 - `auth.protect_ui`
 
+Authentication options:
+
+- Anonymous read-only UI/API access when `auth.protect_ui: false`
+- Local session-based browser login with cookie sessions
+- Local users with `viewer`, `editor`, and `admin` roles
+- Legacy admin credentials from `config.yaml`
+- API key access for automation/integrations
+
 Ways to provide API key:
 
 - Header `X-API-Key: <key>`
 - Header `Authorization: Bearer <key>`
 - Query `?api_key=<key>`
 
-Important: current UI login supports Basic Auth (`username/password`) only. For `api_key` mode, use an API client or enable `both`.
+UI behavior:
+
+- `viewer`: can browse dashboard, lists, details, timeline, CSV export
+- `editor`: can add/edit/delete/reorder domains and folders, and trigger checks
+- `admin`: can also manage settings and local users
+
+Important: browser login uses local sessions and accepts either a local UI user or the legacy admin username/password from `config.yaml`. API key mode is still available for automation and can be combined with browser login by using `mode: both`.
 
 ## REST API (Main Endpoints)
 
@@ -288,16 +404,28 @@ Important: current UI login supports Basic Auth (`username/password`) only. For 
 - `GET /health`
 - `GET /metrics` (if enabled)
 
+### Access / UI Bootstrap
+
+- `GET /api/bootstrap`
+- `GET /api/me`
+- `POST /api/session/login`
+- `POST /api/session/logout`
+
 ### Config
 
 - `GET /api/config`
 - `PUT /api/config`
 - `GET /api/settings` (compat)
 - `PUT /api/settings` (compat)
+- `GET /api/users`
+- `POST /api/users`
+- `PUT /api/users/:id`
+- `DELETE /api/users/:id`
 
 ### Domains
 
 - `GET /api/domains`
+- `GET /api/domains/search` - server-side inventory query with `search`, `status`, `tag`, `folder_id`, `metadata_filters`, `ssl_expiry_lte`, `domain_expiry_lte`, `sort_by`, `sort_dir`, `page`, `page_size`
 - `POST /api/domains` - accepts `tags` (string or array), `metadata`, `custom_ca_pem`, `check_mode`, `dns_servers`, `enabled`
 - `GET /api/domains/:id`
 - `PUT /api/domains/:id` - accepts `name` (optional), `tags` (string or array), `metadata`, `custom_ca_pem`, `check_mode`, `dns_servers`, `enabled`; omitted fields keep current values; triggers re-check on significant changes
@@ -314,6 +442,17 @@ Important: current UI login supports Basic Auth (`username/password`) only. For 
 - `POST /api/folders`
 - `PUT /api/folders/:id`
 - `DELETE /api/folders/:id`
+
+### Custom Inventory Fields
+
+- `GET /api/custom-fields`
+- `POST /api/custom-fields`
+- `PUT /api/custom-fields/:id`
+- `DELETE /api/custom-fields/:id`
+
+### Tags
+
+- `GET /api/tags`
 
 ### Summary
 
@@ -428,7 +567,7 @@ Metrics are exposed at `prometheus.path` (default: `/metrics`).
 |--------|-------------|
 | `domain_ssl_expiry_days` | Days until SSL certificate expires |
 | `domain_expiry_days` | Days until domain registration expires (only for `full` mode) |
-| `domain_overall_status` | 0=ok, 1=warning, 2=critical, 3=error |
+| `domain_overall_status` | 0=ok, 1=warning, 2=critical, 3=error, 4=unknown |
 | `domain_ssl_chain_valid` | 1=valid, 0=invalid |
 | `domain_check_success{type="ssl\|domain"}` | 1=success, 0=failure |
 | `domain_check_duration_ms` | Check duration in milliseconds |
@@ -443,6 +582,7 @@ Metrics are exposed at `prometheus.path` (default: `/metrics`).
 | `domain_crl_status` | good=1, unknown=0, revoked=-1 |
 | `domain_caa_present` | 1=yes, 0=no |
 | `domain_tag_info{domain,tag}` | Static tag info metric with value `1` for each domain/tag pair |
+| `domain_metadata_info{domain,key,value}` | Static metadata info metric with value `1` for each domain metadata key/value pair |
 
 ### Counter metrics
 
@@ -457,6 +597,7 @@ Metrics are exposed at `prometheus.path` (default: `/metrics`).
 - When a domain is deleted, all its metric series are cleaned up
 - `domain_monitor_total_domains` tracks the total count
 - `domain_tag_info` is the recommended metric for Grafana filtering or Prometheus joins by tag
+- `domain_metadata_info` exposes structured metadata for Prometheus/Grafana joins without changing the label set of the core operational metrics
 - `domain_expiry_days` may be negative for already expired registrations, which is expected and indicates how many days ago expiry happened
 
 Example PromQL:
@@ -465,10 +606,15 @@ Example PromQL:
 domain_ssl_expiry_days * on(domain) group_left(tag) domain_tag_info{tag="prod"}
 ```
 
+```promql
+domain_ssl_expiry_days * on(domain) group_left(value) domain_metadata_info{key="owner_email", value="me@gmail.com"}
+```
+
 Note:
 
-- Only tags are exported as Prometheus labels.
-- Structured metadata remains available in the UI, REST API, CSV export, and JSON import/export workflows, but is intentionally not exported as free-form metric labels to avoid high-cardinality issues.
+- Tags are exported through `domain_tag_info`.
+- Structured metadata and custom field values are exported through `domain_metadata_info`.
+- Metadata is emitted as a dedicated info metric instead of being duplicated onto every operational metric, which keeps the main gauge/counter label sets stable while still allowing Prometheus joins and filtering.
 
 Ready-to-use files:
 - `monitoring/grafana-dashboard.json`
@@ -518,7 +664,7 @@ data                  # SQLite DB (runtime)
 ## Notes
 
 - Scheduler polls every minute and runs checks according to `domain.check_interval`.
-- `checker.interval` and `checker.retry_count` exist in config, but current scheduling behavior relies on per-domain `check_interval`.
+- Per-domain `check_interval` controls scheduling cadence, while `checker.retry_count` controls immediate retry attempts for transient check failures inside a single run.
 - With auth enabled, `/api` protection is on by default (`protect_api: true`).
 - Runtime config access is thread-safe: reads go through `Snapshot()`, runtime updates apply via `ApplyFrom()`, and `Save()` writes a normalized snapshot to disk.
 - Restart is required for startup-only settings such as `server.host`, `server.port`, `database.path`, `checker.concurrent_checks`, `prometheus.enabled`, `prometheus.path`, `logging.json`, and `features.structured_logs`.

@@ -28,7 +28,6 @@ export default defineConfig({
       output: {
         manualChunks: {
           'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          'charts': ['recharts'],
           'ui': ['lucide-react', 'clsx', 'date-fns'],
           'query': ['@tanstack/react-query', 'axios'],
         },

@@ -78,7 +78,7 @@ func TestCleanupDomainRemovesAllKnownSeries(t *testing.T) {
 
 	sslDays := 20
 	domainDays := 5
-	m.UpdateDomain(&db.Domain{Name: "cleanup.internal", Tags: []string{"legacy"}}, &db.Check{
+	m.UpdateDomain(&db.Domain{Name: "cleanup.internal", Tags: []string{"legacy"}, Metadata: map[string]string{"owner": "platform"}}, &db.Check{
 		CheckedAt:                time.Unix(1710001100, 0),
 		SSLExpiryDays:            &sslDays,
 		SSLChainValid:            true,
@@ -86,7 +86,7 @@ func TestCleanupDomainRemovesAllKnownSeries(t *testing.T) {
 		CheckDuration:            10,
 		RegistrationCheckSkipped: true,
 	}, cfg)
-	m.UpdateDomain(&db.Domain{Name: "cleanup.internal", Tags: []string{"legacy", "api"}}, &db.Check{
+	m.UpdateDomain(&db.Domain{Name: "cleanup.internal", Tags: []string{"legacy", "api"}, Metadata: map[string]string{"owner": "platform", "service": "api"}}, &db.Check{
 		CheckedAt:                time.Unix(1710001200, 0),
 		SSLExpiryDays:            &sslDays,
 		DomainExpiryDays:         &domainDays,
@@ -113,6 +113,7 @@ func TestCleanupDomainRemovesAllKnownSeries(t *testing.T) {
 		{"domain_checks_total", map[string]string{"domain": "cleanup.internal", "status": "warning"}},
 		{"domain_registration_check_skipped_total", map[string]string{"domain": "cleanup.internal"}},
 		{"domain_tag_info", map[string]string{"domain": "cleanup.internal", "tag": "api"}},
+		{"domain_metadata_info", map[string]string{"domain": "cleanup.internal", "key": "owner", "value": "platform"}},
 	} {
 		if !metricSeriesExists(t, reg, tc.name, tc.labels) {
 			t.Fatalf("expected metric series to exist before cleanup: %s %v", tc.name, tc.labels)
@@ -132,6 +133,7 @@ func TestCleanupDomainRemovesAllKnownSeries(t *testing.T) {
 		{"domain_registration_check_skipped_total", map[string]string{"domain": "cleanup.internal"}},
 		{"domain_caa_present", map[string]string{"domain": "cleanup.internal"}},
 		{"domain_tag_info", map[string]string{"domain": "cleanup.internal", "tag": "api"}},
+		{"domain_metadata_info", map[string]string{"domain": "cleanup.internal", "key": "owner", "value": "platform"}},
 	} {
 		if metricSeriesExists(t, reg, tc.name, tc.labels) {
 			t.Fatalf("expected metric series to be deleted: %s %v", tc.name, tc.labels)
@@ -157,6 +159,64 @@ func TestSyncDomainReplacesTagSeries(t *testing.T) {
 	}
 	if !metricSeriesExists(t, reg, "domain_tag_info", map[string]string{"domain": "tags.internal", "tag": "corp"}) {
 		t.Fatal("expected corp tag series to exist")
+	}
+}
+
+func TestSyncDomainReplacesMetadataSeries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewWithRegisterer(reg)
+
+	m.SyncDomain(&db.Domain{
+		Name:     "metadata.internal",
+		Metadata: map[string]string{"owner": "platform", "zone": "corp"},
+	})
+	if !metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "owner", "value": "platform"}) {
+		t.Fatal("expected owner metadata series to exist")
+	}
+	if !metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "zone", "value": "corp"}) {
+		t.Fatal("expected zone metadata series to exist")
+	}
+
+	m.SyncDomain(&db.Domain{
+		Name:     "metadata.internal",
+		Metadata: map[string]string{"owner": "ops", "environment": "prod"},
+	})
+	if metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "owner", "value": "platform"}) {
+		t.Fatal("expected old owner metadata series to be removed")
+	}
+	if metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "zone", "value": "corp"}) {
+		t.Fatal("expected old zone metadata series to be removed")
+	}
+	if !metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "owner", "value": "ops"}) {
+		t.Fatal("expected new owner metadata series to exist")
+	}
+	if !metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "environment", "value": "prod"}) {
+		t.Fatal("expected environment metadata series to exist")
+	}
+}
+
+func TestUpdateDomainMapsUnknownStatusSeparatelyFromError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewWithRegisterer(reg)
+	cfg := config.Default()
+	sslDays := 120
+
+	m.UpdateDomain(&db.Domain{Name: "unknown.internal"}, &db.Check{
+		CheckedAt:     time.Unix(1710002400, 0),
+		SSLExpiryDays: &sslDays,
+		SSLChainValid: true,
+		OverallStatus: "unknown",
+		CheckDuration: 10,
+		SSLCheckError: "",
+		DomainSource:  "",
+	}, cfg)
+
+	value, ok := gaugeValue(t, reg, "domain_overall_status", map[string]string{"domain": "unknown.internal"})
+	if !ok {
+		t.Fatal("expected domain_overall_status series to exist")
+	}
+	if value != 4 {
+		t.Fatalf("expected unknown status to map to 4, got %v", value)
 	}
 }
 

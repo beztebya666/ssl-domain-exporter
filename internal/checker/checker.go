@@ -1,7 +1,9 @@
 package checker
 
 import (
+	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +25,20 @@ func New(cfg *config.Config, database *db.DB, m *metrics.Metrics, n *Notifier) *
 	return &Checker{cfg: cfg, db: database, metrics: m, notifier: n}
 }
 
+func (c *Checker) NotificationStatuses() []DeliveryStatus {
+	if c == nil || c.notifier == nil {
+		return nil
+	}
+	return c.notifier.Status()
+}
+
+func (c *Checker) SendTestNotifications() []TestResult {
+	if c == nil || c.notifier == nil {
+		return nil
+	}
+	return c.notifier.SendTest()
+}
+
 func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 	start := time.Now()
 
@@ -40,19 +56,48 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		prevStatus = prevCheck.OverallStatus
 	}
 
+	attempts := cfg.Checker.RetryCount + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var check *db.Check
+	for attempt := 1; attempt <= attempts; attempt++ {
+		check = c.runCheckOnce(domain, cfg, timeout)
+		assessment := evaluateStatus(check, cfg)
+		check.PrimaryReasonCode = assessment.PrimaryReasonCode
+		check.PrimaryReasonText = assessment.PrimaryReasonText
+		check.StatusReasons = assessment.Reasons
+		check.OverallStatus = assessment.Status
+
+		if attempt == attempts || !shouldRetryCheck(check) {
+			break
+		}
+
+		log.Printf("Check retry %d/%d for %s due to transient errors", attempt+1, attempts, domain.Name)
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+	}
+
+	check.CheckDuration = time.Since(start).Milliseconds()
+
+	if err := c.db.SaveCheck(check); err != nil {
+		log.Printf("Error saving check for %s: %v", domain.Name, err)
+	}
+
+	c.metrics.UpdateDomain(domain, check, cfg)
+	c.notifier.Notify(domain.Name, check, prevStatus)
+	return check
+}
+
+func (c *Checker) runCheckOnce(domain *db.Domain, cfg *config.Config, timeout time.Duration) *db.Check {
 	check := &db.Check{
 		DomainID:  domain.ID,
 		CheckedAt: time.Now(),
 	}
 	port := domainPort(domain.Port)
-
-	// Build DNS resolve context for this domain
 	rc := BuildResolveContext(domain, cfg)
 
-	// --- SSL Check (always) ---
 	sslResult := CheckSSL(domain.Name, port, timeout, domain.CustomCAPEM, rc)
-
-	// Record which DNS server actually responded (set after SSL check triggers resolution)
 	check.DNSServerUsed = rc.EffectiveServerDesc()
 	check.SSLIssuer = sslResult.Issuer
 	check.SSLSubject = sslResult.Subject
@@ -68,7 +113,6 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		check.SSLExpiryDays = &sslResult.ExpiryDays
 	}
 
-	// --- Cipher Check (optional feature, works for all check modes) ---
 	if cfg.Features.CipherCheck {
 		cipher := CheckCipherSuite(domain.Name, port, timeout, rc)
 		check.CipherWeak = cipher.IsWeak
@@ -77,7 +121,6 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		check.CipherDetails = CipherSummary(cipher)
 	}
 
-	// --- HTTP Check (optional feature, works for all check modes) ---
 	if cfg.Features.HTTPCheck {
 		httpResult := CheckHTTP(domain.Name, port, timeout, domain.CustomCAPEM, rc)
 		check.HTTPStatusCode = httpResult.StatusCode
@@ -89,7 +132,6 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		check.HTTPError = httpResult.Error
 	}
 
-	// --- Domain Registration Check (RDAP/WHOIS) - only when check_mode is "full" ---
 	if domain.RegistrationCheckEnabled() {
 		domResult := CheckDomainRegistration(domain.Name, timeout)
 		if domResult.Error != "" && cfg.Domains.SubdomainFallback && isSubdomain(domain.Name) {
@@ -114,7 +156,6 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		check.DomainSource = domResult.Source
 		check.RegistrationCheckSkipped = false
 	} else {
-		// SSL-only mode: skip RDAP/WHOIS entirely
 		check.DomainStatus = "not_applicable"
 		check.DomainSource = "skipped"
 		check.RegistrationCheckSkipped = true
@@ -122,7 +163,6 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		log.Printf("[domain] %s: registration check skipped (ssl_only mode)", domain.Name)
 	}
 
-	// --- CAA Check (optional feature, works for all check modes) ---
 	if cfg.Features.CAACheck {
 		dnsResult := CheckCAA(domain.Name, timeout, cfg.Domains.FallbackDepth, rc)
 		check.CAAPresent = dnsResult.CAAPresent
@@ -135,7 +175,6 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		}
 	}
 
-	// --- Revocation Check (optional feature, works for all check modes) ---
 	if cfg.Features.OCSPCheck || cfg.Features.CRLCheck {
 		rev := CheckRevocation(domain.Name, port, timeout, cfg.Features.OCSPCheck, cfg.Features.CRLCheck, rc)
 		check.OCSPStatus = rev.OCSPStatus
@@ -144,16 +183,20 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 		check.CRLError = rev.CRLError
 	}
 
-	check.CheckDuration = time.Since(start).Milliseconds()
-	check.OverallStatus = computeStatus(check, cfg)
-
-	if err := c.db.SaveCheck(check); err != nil {
-		log.Printf("Error saving check for %s: %v", domain.Name, err)
-	}
-
-	c.metrics.UpdateDomain(domain, check, cfg)
-	c.notifier.Notify(domain.Name, check, prevStatus)
 	return check
+}
+
+func shouldRetryCheck(check *db.Check) bool {
+	if check == nil {
+		return false
+	}
+	if check.SSLCheckError != "" || check.HTTPError != "" || check.CAAError != "" || check.OCSPError != "" || check.CRLError != "" {
+		return true
+	}
+	if !check.RegistrationCheckSkipped && check.DomainCheckError != "" {
+		return true
+	}
+	return check.OverallStatus == "error"
 }
 
 func domainPort(port int) int {
@@ -163,18 +206,53 @@ func domainPort(port int) int {
 	return port
 }
 
-// computeStatus determines the overall status based on the check results.
-// It uses RegistrationCheckSkipped from the check record itself (audit-safe).
+type statusAssessment struct {
+	Status            string
+	PrimaryReasonCode string
+	PrimaryReasonText string
+	Reasons           []db.StatusReason
+}
+
+// computeStatus preserves the legacy testable helper while status reasons are computed separately.
 func computeStatus(check *db.Check, cfg *config.Config) string {
+	return evaluateStatus(check, cfg).Status
+}
+
+func evaluateStatus(check *db.Check, cfg *config.Config) statusAssessment {
 	registrationSkipped := check.RegistrationCheckSkipped
+	reasons := make([]db.StatusReason, 0, 8)
+	addReason := func(code, severity, summary, detail string) {
+		reasons = append(reasons, db.StatusReason{
+			Code:     code,
+			Severity: severity,
+			Summary:  summary,
+			Detail:   detail,
+		})
+	}
+	addPolicyReason := func(code, severity, summary, detail string, affectsBadge bool) {
+		if !affectsBadge {
+			severity = "advisory"
+		}
+		addReason(code, severity, summary, detail)
+	}
 
 	// If both SSL and domain checks failed (and domain was actually checked), it's an error
 	if check.SSLCheckError != "" && !registrationSkipped && check.DomainCheckError != "" {
-		return "error"
+		addReason(
+			"ssl_and_domain_check_failed",
+			"error",
+			"SSL and domain registration checks failed",
+			fmt.Sprintf("SSL check failed: %s; domain registration check failed: %s", check.SSLCheckError, check.DomainCheckError),
+		)
 	}
 	// If SSL check failed entirely and it's ssl_only mode, that's an error
 	if check.SSLCheckError != "" && registrationSkipped {
-		return "error"
+		addReason(
+			"ssl_check_failed",
+			"error",
+			"SSL check failed",
+			check.SSLCheckError,
+		)
 	}
 
 	alerts := cfg.Alerts
@@ -182,38 +260,74 @@ func computeStatus(check *db.Check, cfg *config.Config) string {
 	// SSL expiry thresholds
 	if check.SSLExpiryDays != nil {
 		if *check.SSLExpiryDays <= alerts.SSLExpiryCriticalDays {
-			return "critical"
-		}
-		if *check.SSLExpiryDays <= alerts.SSLExpiryWarningDays {
-			return "warning"
+			addReason(
+				"ssl_expiry_critical",
+				"critical",
+				"SSL certificate expiry is in the critical range",
+				fmt.Sprintf("SSL certificate expires in %d days (critical threshold: %d)", *check.SSLExpiryDays, alerts.SSLExpiryCriticalDays),
+			)
+		} else if *check.SSLExpiryDays <= alerts.SSLExpiryWarningDays {
+			addReason(
+				"ssl_expiry_warning",
+				"warning",
+				"SSL certificate expiry is in the warning range",
+				fmt.Sprintf("SSL certificate expires in %d days (warning threshold: %d)", *check.SSLExpiryDays, alerts.SSLExpiryWarningDays),
+			)
 		}
 	}
 
 	// Domain expiry thresholds (only when registration was actually checked)
 	if !registrationSkipped && check.DomainExpiryDays != nil {
 		if *check.DomainExpiryDays <= alerts.DomainExpiryCriticalDays {
-			return "critical"
-		}
-		if *check.DomainExpiryDays <= alerts.DomainExpiryWarningDays {
-			return "warning"
+			addReason(
+				"domain_expiry_critical",
+				"critical",
+				"Domain registration expiry is in the critical range",
+				fmt.Sprintf("Domain registration expires in %d days (critical threshold: %d)", *check.DomainExpiryDays, alerts.DomainExpiryCriticalDays),
+			)
+		} else if *check.DomainExpiryDays <= alerts.DomainExpiryWarningDays {
+			addReason(
+				"domain_expiry_warning",
+				"warning",
+				"Domain registration expiry is in the warning range",
+				fmt.Sprintf("Domain registration expires in %d days (warning threshold: %d)", *check.DomainExpiryDays, alerts.DomainExpiryWarningDays),
+			)
 		}
 	}
 
 	// SSL chain validity
 	if check.SSLCheckError == "" && !check.SSLChainValid {
-		return "warning"
+		detail := "The certificate chain could not be validated"
+		if check.SSLChainError != "" {
+			detail = check.SSLChainError
+		}
+		if hasSelfSignedLeaf(check) {
+			addPolicyReason("self_signed_certificate", "warning", "The certificate is self-signed", detail, cfg.StatusPolicy.BadgeOnSelfSigned)
+		} else {
+			addPolicyReason("ssl_chain_invalid", "warning", "SSL certificate chain is invalid", detail, cfg.StatusPolicy.BadgeOnInvalidChain)
+		}
 	}
 
 	// HTTP checks
 	if cfg.Features.HTTPCheck {
 		if check.HTTPError != "" {
-			return "warning"
+			addPolicyReason("http_check_failed", "warning", "HTTP check failed", check.HTTPError, cfg.StatusPolicy.BadgeOnHTTPProbeError)
 		}
 		if check.HTTPStatusCode >= 500 {
-			return "critical"
-		}
-		if check.HTTPStatusCode >= 400 {
-			return "warning"
+			addReason(
+				"http_status_critical",
+				"critical",
+				"HTTP endpoint is returning a server error",
+				fmt.Sprintf("HTTP status code %d returned by %s", check.HTTPStatusCode, effectiveHTTPURL(check)),
+			)
+		} else if check.HTTPStatusCode >= 400 {
+			addPolicyReason(
+				"http_status_warning",
+				"warning",
+				"HTTP endpoint is returning a client error",
+				fmt.Sprintf("HTTP status code %d returned by %s", check.HTTPStatusCode, effectiveHTTPURL(check)),
+				cfg.StatusPolicy.BadgeOnHTTPClientError,
+			)
 		}
 	}
 
@@ -221,46 +335,136 @@ func computeStatus(check *db.Check, cfg *config.Config) string {
 	if cfg.Features.CipherCheck {
 		switch strings.ToUpper(check.CipherGrade) {
 		case "F":
-			return "critical"
+			addReason("cipher_grade_f", "critical", "TLS cipher configuration is critically weak", reasonOrFallback(check.CipherDetails, check.CipherWeakReason, "Cipher grade F"))
 		case "C":
-			return "warning"
+			addPolicyReason("cipher_grade_c", "warning", "TLS cipher configuration needs attention", reasonOrFallback(check.CipherDetails, check.CipherWeakReason, "Cipher grade C"), cfg.StatusPolicy.BadgeOnCipherWarning)
 		}
 	}
 
 	// OCSP
 	if cfg.Features.OCSPCheck {
 		if check.OCSPStatus == "revoked" {
-			return "critical"
+			addReason("ocsp_revoked", "critical", "OCSP reports the certificate as revoked", "The upstream OCSP responder returned revoked")
 		}
 		if check.OCSPStatus == "unknown" {
-			return "warning"
+			addPolicyReason("ocsp_unknown", "warning", "OCSP status is unknown", reasonOrFallback(check.OCSPError, "", "The OCSP responder did not provide a definitive status"), cfg.StatusPolicy.BadgeOnOCSPUnknown)
 		}
 	}
 
 	// CRL
 	if cfg.Features.CRLCheck {
 		if check.CRLStatus == "revoked" {
-			return "critical"
-		}
-		if check.CRLStatus == "unknown" {
-			return "warning"
+			addReason("crl_revoked", "critical", "CRL reports the certificate as revoked", "The certificate appears on the certificate revocation list")
+		} else if check.CRLStatus == "unknown" {
+			addPolicyReason("crl_unknown", "warning", "CRL status is unknown", reasonOrFallback(check.CRLError, "", "The CRL check did not provide a definitive status"), cfg.StatusPolicy.BadgeOnCRLUnknown)
 		}
 	}
 
 	// CAA
 	if cfg.Features.CAACheck && !check.CAAPresent && check.CAAError == "" {
-		return "warning"
+		target := check.CAAQueryDomain
+		if target == "" {
+			target = "the checked domain"
+		}
+		addPolicyReason("caa_missing", "warning", "CAA records are not present", fmt.Sprintf("No CAA records were found for %s", target), cfg.StatusPolicy.BadgeOnCAAMissing)
 	}
 
 	// SSL error alone (without domain error) is a warning
 	if check.SSLCheckError != "" {
-		return "warning"
+		addReason("ssl_check_warning", "warning", "SSL check returned an error", check.SSLCheckError)
 	}
 
 	// Domain check error (only when it was actually checked) is a warning
 	if !registrationSkipped && check.DomainCheckError != "" {
-		return "warning"
+		addPolicyReason("domain_check_warning", "warning", "Domain registration lookup returned an error", check.DomainCheckError, cfg.StatusPolicy.BadgeOnDomainLookupError)
 	}
 
-	return "ok"
+	if len(reasons) == 0 {
+		return statusAssessment{Status: "ok"}
+	}
+
+	sort.SliceStable(reasons, func(i, j int) bool {
+		return severityRank(reasons[i].Severity) > severityRank(reasons[j].Severity)
+	})
+
+	primary := reasons[0]
+	for _, reason := range reasons {
+		if reason.Severity != "advisory" {
+			primary = reason
+			break
+		}
+	}
+
+	status := "ok"
+	for _, reason := range reasons {
+		if reason.Severity == "advisory" {
+			continue
+		}
+		status = reason.Severity
+		break
+	}
+
+	return statusAssessment{
+		Status:            status,
+		PrimaryReasonCode: primary.Code,
+		PrimaryReasonText: firstNonEmpty(primary.Detail, primary.Summary),
+		Reasons:           reasons,
+	}
+}
+
+func severityRank(severity string) int {
+	switch severity {
+	case "error":
+		return 4
+	case "critical":
+		return 3
+	case "warning":
+		return 2
+	case "advisory":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func reasonOrFallback(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func effectiveHTTPURL(check *db.Check) string {
+	if strings.TrimSpace(check.HTTPFinalURL) != "" {
+		return check.HTTPFinalURL
+	}
+	return "the checked HTTP endpoint"
+}
+
+func hasSelfSignedLeaf(check *db.Check) bool {
+	if check == nil {
+		return false
+	}
+	for _, cert := range check.SSLChainDetails {
+		if cert.IsSelfSigned && !cert.IsCA {
+			return true
+		}
+	}
+	if len(check.SSLChainDetails) == 1 && check.SSLChainDetails[0].IsSelfSigned {
+		return true
+	}
+	return false
 }
