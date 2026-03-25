@@ -35,7 +35,7 @@ jobs:
             package-lock.json
             frontend/package-lock.json
       - name: Install root helpers
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Install frontend
         run: npm --prefix frontend ci
       - name: Root npm audit
@@ -64,7 +64,7 @@ jobs:
             package-lock.json
             frontend/package-lock.json
       - name: Install root helpers
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Install frontend
         run: npm --prefix frontend ci
       - name: Full release check
