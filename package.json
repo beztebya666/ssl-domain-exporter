@@ -10,11 +10,13 @@
     "install": "npm run install:frontend",
     "dev": "npm run frontend:dev",
     "build": "npm run frontend:build",
+    "test:e2e": "npm run frontend:test:e2e",
     "preview": "npm run frontend:preview",
     "install:frontend": "npm run frontend:install",
     "frontend:install": "npm --prefix frontend install",
     "frontend:dev": "npm --prefix frontend run dev",
     "frontend:build": "npm --prefix frontend run build",
-    "frontend:preview": "npm --prefix frontend run preview"
+    "frontend:preview": "npm --prefix frontend run preview",
+    "frontend:test:e2e": "npm --prefix frontend run test:e2e"
   }
 }

@@ -5,6 +5,8 @@ frontend/dist/
 /server
 *.exe
 .env
+.env.local
+.env.*.local
 .claude/settings.local.json
 .claude/
 .vscode/
@@ -13,3 +15,7 @@ frontend/dist/
 *.log
 coverage.out
 dist/
+playwright-report/
+test-results/
+frontend/playwright-report/
+frontend/test-results/

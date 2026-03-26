@@ -47,6 +47,7 @@ func CheckRevocation(domain string, port int, timeout time.Duration, checkOCSP b
 	}
 
 	dialer := &net.Dialer{Timeout: timeout}
+	//nolint:gosec // Revocation checks need the peer chain even when TLS validation would fail; certificate trust is evaluated separately.
 	conn, err := tls.DialWithDialer(dialer, "tcp", dialAddr, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         serverName,

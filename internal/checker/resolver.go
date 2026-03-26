@@ -161,7 +161,7 @@ func resolveWithServers(hostname string, servers []string, timeout time.Duration
 	}
 
 	if lastErr != nil {
-		return "", "", fmt.Errorf("DNS query failed: %v", lastErr)
+		return "", "", fmt.Errorf("DNS query failed: %w", lastErr)
 	}
 	return "", "", fmt.Errorf("no A/AAAA records found")
 }

@@ -2,7 +2,7 @@ package checker
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -32,11 +32,11 @@ func (c *Checker) NotificationStatuses() []DeliveryStatus {
 	return c.notifier.Status()
 }
 
-func (c *Checker) SendTestNotifications() []TestResult {
+func (c *Checker) SendTestNotifications(channel string, cfgOverride *config.Config) ([]TestResult, error) {
 	if c == nil || c.notifier == nil {
-		return nil
+		return nil, nil
 	}
-	return c.notifier.SendTest()
+	return c.notifier.SendTest(cfgOverride, channel)
 }
 
 func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
@@ -74,14 +74,14 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 			break
 		}
 
-		log.Printf("Check retry %d/%d for %s due to transient errors", attempt+1, attempts, domain.Name)
+		slog.Warn("Retrying domain check due to transient errors", "domain", domain.Name, "attempt", attempt+1, "max_attempts", attempts)
 		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 	}
 
 	check.CheckDuration = time.Since(start).Milliseconds()
 
 	if err := c.db.SaveCheck(check); err != nil {
-		log.Printf("Error saving check for %s: %v", domain.Name, err)
+		slog.Error("Failed to save check", "domain", domain.Name, "error", err)
 	}
 
 	c.metrics.UpdateDomain(domain, check, cfg)
@@ -140,7 +140,7 @@ func (c *Checker) runCheckOnce(domain *db.Domain, cfg *config.Config, timeout ti
 				candidate := candidates[i]
 				fallbackResult := CheckDomainRegistration(candidate, timeout)
 				if fallbackResult.Error == "" {
-					log.Printf("[domain] %s: fallback to parent %s", domain.Name, candidate)
+					slog.Info("Falling back to parent domain registration lookup", "domain", domain.Name, "candidate", candidate)
 					fallbackResult.Source = fallbackResult.Source + " (parent lookup: " + candidate + ")"
 					domResult = fallbackResult
 					break
@@ -160,7 +160,7 @@ func (c *Checker) runCheckOnce(domain *db.Domain, cfg *config.Config, timeout ti
 		check.DomainSource = "skipped"
 		check.RegistrationCheckSkipped = true
 		check.RegistrationSkipReason = "check_mode=ssl_only"
-		log.Printf("[domain] %s: registration check skipped (ssl_only mode)", domain.Name)
+		slog.Info("Registration check skipped for ssl_only mode", "domain", domain.Name)
 	}
 
 	if cfg.Features.CAACheck {
@@ -370,7 +370,7 @@ func evaluateStatus(check *db.Check, cfg *config.Config) statusAssessment {
 	}
 
 	// SSL error alone (without domain error) is a warning
-	if check.SSLCheckError != "" {
+	if check.SSLCheckError != "" && !registrationSkipped {
 		addReason("ssl_check_warning", "warning", "SSL check returned an error", check.SSLCheckError)
 	}
 

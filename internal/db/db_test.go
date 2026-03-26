@@ -50,6 +50,9 @@ func TestMigrateLegacyDatabaseAddsEnterpriseColumns(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("create legacy schema: %v", err)
 	}
+	if _, err := database.sql.Exec(`INSERT INTO domains (name, tags) VALUES ('legacy.example.com', 'prod, infra')`); err != nil {
+		t.Fatalf("seed legacy tags: %v", err)
+	}
 
 	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate legacy schema: %v", err)
@@ -64,6 +67,72 @@ func TestMigrateLegacyDatabaseAddsEnterpriseColumns(t *testing.T) {
 		if !columnExists(t, database, "domain_checks", col) {
 			t.Fatalf("expected domain_checks.%s to exist after migration", col)
 		}
+	}
+
+	legacy, err := database.GetDomainByID(1)
+	if err != nil {
+		t.Fatalf("get migrated legacy domain: %v", err)
+	}
+	if legacy == nil || len(legacy.Tags) != 2 || legacy.Tags[0] != "prod" || legacy.Tags[1] != "infra" {
+		t.Fatalf("expected legacy tags to be backfilled into tags_json, got %+v", legacy)
+	}
+}
+
+func TestMigrateLegacyFoldersAddsTimestampsAndListWorks(t *testing.T) {
+	database := newTestDB(t)
+	defer database.Close()
+
+	if _, err := database.sql.Exec(`
+		DROP TABLE IF EXISTS domains;
+		DROP TABLE IF EXISTS folders;
+		CREATE TABLE folders (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE domains (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE NOT NULL,
+			enabled INTEGER DEFAULT 1,
+			check_interval INTEGER DEFAULT 21600,
+			tags TEXT DEFAULT '',
+			folder_id INTEGER,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`); err != nil {
+		t.Fatalf("create legacy folder schema: %v", err)
+	}
+
+	if _, err := database.sql.Exec(`INSERT INTO folders (name) VALUES ('Operations')`); err != nil {
+		t.Fatalf("seed legacy folder: %v", err)
+	}
+	if _, err := database.sql.Exec(`INSERT INTO domains (name, folder_id) VALUES ('legacy.example.com', 1)`); err != nil {
+		t.Fatalf("seed legacy domain: %v", err)
+	}
+
+	if err := database.Migrate(); err != nil {
+		t.Fatalf("migrate legacy folder schema: %v", err)
+	}
+
+	for _, col := range []string{"sort_order", "created_at", "updated_at"} {
+		if !columnExists(t, database, "folders", col) {
+			t.Fatalf("expected folders.%s to exist after migration", col)
+		}
+	}
+
+	folders, err := database.GetFolders()
+	if err != nil {
+		t.Fatalf("list folders after migration: %v", err)
+	}
+	if len(folders) != 1 {
+		t.Fatalf("expected 1 folder, got %d", len(folders))
+	}
+	if folders[0].DomainCount != 1 {
+		t.Fatalf("expected domain count 1, got %d", folders[0].DomainCount)
+	}
+	if folders[0].CreatedAt.IsZero() || folders[0].UpdatedAt.IsZero() {
+		t.Fatalf("expected non-zero timestamps, got %+v", folders[0])
 	}
 }
 
@@ -224,6 +293,158 @@ func TestSaveCheckAndGetAllLastChecksKeepAuditFields(t *testing.T) {
 	}
 	if !got.CAAPresent {
 		t.Fatal("expected CAA presence to round-trip")
+	}
+}
+
+func TestGetLastCheckAndAllLastChecksPreferNewestIDOnTimestampTie(t *testing.T) {
+	database := newTestDB(t)
+	defer database.Close()
+
+	domain, err := database.CreateDomain("tie.example.com", nil, nil, "", "full", "", 3600, 443, nil)
+	if err != nil {
+		t.Fatalf("create domain: %v", err)
+	}
+
+	checkedAt := time.Now().UTC().Truncate(time.Second)
+	first := &Check{
+		DomainID:      domain.ID,
+		CheckedAt:     checkedAt,
+		OverallStatus: "warning",
+		CheckDuration: 10,
+		SSLChainValid: true,
+		DomainSource:  "rdap",
+	}
+	second := &Check{
+		DomainID:      domain.ID,
+		CheckedAt:     checkedAt,
+		OverallStatus: "critical",
+		CheckDuration: 12,
+		SSLChainValid: true,
+		DomainSource:  "rdap",
+	}
+	if err := database.SaveCheck(first); err != nil {
+		t.Fatalf("save first check: %v", err)
+	}
+	if err := database.SaveCheck(second); err != nil {
+		t.Fatalf("save second check: %v", err)
+	}
+
+	last, err := database.GetLastCheck(domain.ID)
+	if err != nil {
+		t.Fatalf("GetLastCheck: %v", err)
+	}
+	if last == nil || last.OverallStatus != "critical" {
+		t.Fatalf("expected newest tied check to win, got %+v", last)
+	}
+
+	all, err := database.GetAllLastChecks()
+	if err != nil {
+		t.Fatalf("GetAllLastChecks: %v", err)
+	}
+	if all[domain.ID] == nil || all[domain.ID].OverallStatus != "critical" {
+		t.Fatalf("expected newest tied check from GetAllLastChecks, got %+v", all[domain.ID])
+	}
+}
+
+func TestGetNextScheduledCheckAt(t *testing.T) {
+	database := newTestDB(t)
+	defer database.Close()
+
+	now := time.Now().UTC()
+	domain, err := database.CreateDomain("example.com", nil, nil, "", "full", "", 3600, 443, nil)
+	if err != nil {
+		t.Fatalf("create domain: %v", err)
+	}
+	check := &Check{
+		DomainID:      domain.ID,
+		CheckedAt:     now.Add(-30 * time.Minute),
+		OverallStatus: "ok",
+		CheckDuration: 10,
+		SSLChainValid: true,
+		DomainSource:  "rdap",
+	}
+	if err := database.SaveCheck(check); err != nil {
+		t.Fatalf("save check: %v", err)
+	}
+
+	nextAt, err := database.GetNextScheduledCheckAt(now)
+	if err != nil {
+		t.Fatalf("GetNextScheduledCheckAt: %v", err)
+	}
+	if nextAt == nil {
+		t.Fatal("expected next scheduled check time")
+	}
+	diff := nextAt.Sub(now)
+	if diff < 29*time.Minute || diff > 31*time.Minute {
+		t.Fatalf("expected next scheduled check around 30m, got %s", diff)
+	}
+}
+
+func TestGetNextScheduledCheckAtParsesLegacyTimestampWithMonotonicSuffix(t *testing.T) {
+	database := newTestDB(t)
+	defer database.Close()
+
+	now := time.Date(2026, time.March, 27, 10, 0, 0, 0, time.UTC)
+	domain, err := database.CreateDomain("legacy.example.com", nil, nil, "", "full", "", 3600, 443, nil)
+	if err != nil {
+		t.Fatalf("create domain: %v", err)
+	}
+
+	if _, err := database.sql.Exec(`
+		INSERT INTO domain_checks (
+			domain_id, checked_at, overall_status, check_duration_ms, ssl_chain_valid, domain_source
+		) VALUES (?, ?, ?, ?, ?, ?)
+	`, domain.ID, "2026-03-27 09:30:00.123456789 +0000 UTC m=+0.126827601", "ok", 10, true, "rdap"); err != nil {
+		t.Fatalf("insert legacy check: %v", err)
+	}
+
+	nextAt, err := database.GetNextScheduledCheckAt(now)
+	if err != nil {
+		t.Fatalf("GetNextScheduledCheckAt: %v", err)
+	}
+	if nextAt == nil {
+		t.Fatal("expected next scheduled check time")
+	}
+	diff := nextAt.Sub(now)
+	if diff < 29*time.Minute || diff > 31*time.Minute {
+		t.Fatalf("expected next scheduled check around 30m, got %s", diff)
+	}
+}
+
+func TestListDomainsPageAndListTagsUseTagsJSON(t *testing.T) {
+	database := newTestDB(t)
+	defer database.Close()
+
+	domain, err := database.CreateDomain("json-tags.example.com", []string{"Prod", "owner-email"}, nil, "", "full", "", 3600, 443, nil)
+	if err != nil {
+		t.Fatalf("create domain: %v", err)
+	}
+	if _, err := database.sql.Exec(`UPDATE domains SET tags = '' WHERE id = ?`, domain.ID); err != nil {
+		t.Fatalf("desync legacy tags column: %v", err)
+	}
+
+	page, total, err := database.ListDomainsPage(DomainListQuery{Search: "prod", Page: 1, PageSize: 20})
+	if err != nil {
+		t.Fatalf("ListDomainsPage search: %v", err)
+	}
+	if total != 1 || len(page) != 1 || page[0].ID != domain.ID {
+		t.Fatalf("expected search by tags_json to find domain, total=%d items=%+v", total, page)
+	}
+
+	page, total, err = database.ListDomainsPage(DomainListQuery{Tag: "prod", Page: 1, PageSize: 20})
+	if err != nil {
+		t.Fatalf("ListDomainsPage tag filter: %v", err)
+	}
+	if total != 1 || len(page) != 1 || page[0].ID != domain.ID {
+		t.Fatalf("expected tag filter by tags_json to find domain, total=%d items=%+v", total, page)
+	}
+
+	tags, err := database.ListTags()
+	if err != nil {
+		t.Fatalf("ListTags: %v", err)
+	}
+	if len(tags) != 2 || tags[0] != "owner-email" || tags[1] != "Prod" {
+		t.Fatalf("expected tags_json values to be listed, got %+v", tags)
 	}
 }
 

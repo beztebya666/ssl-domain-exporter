@@ -139,7 +139,7 @@ func (d *DB) CreateCustomField(field CustomField) (*CustomField, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	res, err := tx.Exec(`
 		INSERT INTO custom_fields (
@@ -184,7 +184,7 @@ func (d *DB) UpdateCustomField(id int64, field CustomField) (*CustomField, error
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	if _, err := tx.Exec(`
 		UPDATE custom_fields
@@ -349,6 +349,7 @@ func (d *DB) listCustomFieldOptions(fieldIDs []int64) (map[int64][]CustomFieldOp
 		args = append(args, id)
 	}
 
+	//nolint:gosec // Placeholder list is constructed from argument count only; values remain parameterized.
 	rows, err := d.sql.Query(`
 		SELECT id, field_id, value, label, sort_order, created_at, updated_at
 		FROM custom_field_options

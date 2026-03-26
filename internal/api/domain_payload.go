@@ -198,36 +198,6 @@ func buildUpdateInput(req updateDomainRequest) (domainInput, error) {
 	return in, nil
 }
 
-func parseImportRequest(req importDomainsRequest) (domainInput, []domainInput, string, error) {
-	mode := strings.ToLower(strings.TrimSpace(req.Mode))
-	if mode == "" {
-		mode = "create_only"
-	}
-	if mode != "create_only" && mode != "upsert" {
-		return domainInput{}, nil, "", fmt.Errorf("mode must be create_only or upsert")
-	}
-
-	defaults, err := parseImportMap(req.Defaults, false)
-	if err != nil {
-		return domainInput{}, nil, "", fmt.Errorf("defaults: %w", err)
-	}
-
-	items := make([]domainInput, 0, len(req.Domains))
-	for idx, raw := range req.Domains {
-		item, err := parseImportMap(raw, true)
-		if err != nil {
-			return domainInput{}, nil, "", fmt.Errorf("domains[%d]: %w", idx, err)
-		}
-		if item.Name == "" {
-			return domainInput{}, nil, "", fmt.Errorf("domains[%d]: name/domain is required", idx)
-		}
-		item = mergeImportDefaults(defaults, item)
-		items = append(items, item)
-	}
-
-	return defaults, items, mode, nil
-}
-
 func parseImportMap(raw map[string]any, requireName bool) (domainInput, error) {
 	var in domainInput
 	extraMetadata := map[string]string{}

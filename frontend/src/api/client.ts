@@ -1,6 +1,8 @@
 import axios from 'axios'
 import type {
+  AuditLog,
   AppConfig,
+  BackupFile,
   AuthMe,
   BootstrapConfig,
   Check,
@@ -14,7 +16,9 @@ import type {
   DomainImportResponse,
   DomainWritePayload,
   Folder,
+  HealthStatus,
   NotificationDeliveryStatus,
+  NotificationTestRequest,
   NotificationTestResult,
   Summary,
   TimelineResponse,
@@ -36,6 +40,42 @@ function emitWindowEvent(name: string): void {
   if (typeof window === 'undefined') return
   window.dispatchEvent(new Event(name))
 }
+
+function getCookie(name: string): string | undefined {
+  if (typeof document === 'undefined') return undefined
+  const prefix = `${name}=`
+  return document.cookie
+    .split(';')
+    .map(part => part.trim())
+    .find(part => part.startsWith(prefix))
+    ?.slice(prefix.length)
+}
+
+function findCSRFCookie(): string | undefined {
+  if (typeof document === 'undefined') return undefined
+  const direct = getCookie('ssl_domain_exporter_session_csrf')
+  if (direct) return direct
+  for (const chunk of document.cookie.split(';')) {
+    const [rawKey, ...rawValue] = chunk.trim().split('=')
+    if (rawKey.endsWith('_csrf')) {
+      return rawValue.join('=')
+    }
+  }
+  return undefined
+}
+
+api.interceptors.request.use((request) => {
+  const method = request.method?.toUpperCase() ?? 'GET'
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    return request
+  }
+  const csrfCookie = findCSRFCookie()
+  if (csrfCookie) {
+    request.headers = request.headers ?? {}
+    request.headers['X-CSRF-Token'] = decodeURIComponent(csrfCookie)
+  }
+  return request
+})
 
 api.interceptors.response.use(
   (response) => response,
@@ -156,8 +196,8 @@ export const updateConfig = (data: Partial<AppConfig>): Promise<AppConfig> =>
 export const fetchNotificationStatus = (): Promise<NotificationDeliveryStatus[]> =>
   api.get('/notifications/status').then(r => r.data)
 
-export const testNotifications = (): Promise<NotificationTestResult[]> =>
-  api.post('/notifications/test').then(r => r.data)
+export const testNotifications = (data?: NotificationTestRequest): Promise<NotificationTestResult[]> =>
+  api.post('/notifications/test', data ?? {}).then(r => r.data)
 
 export const fetchUsers = (): Promise<UserAccount[]> =>
   api.get('/users').then(r => r.data)
@@ -170,6 +210,24 @@ export const updateUserAccount = (id: number, data: Partial<UserWritePayload>): 
 
 export const deleteUserAccount = (id: number): Promise<void> =>
   api.delete(`/users/${id}`).then(() => undefined)
+
+export const fetchAuditLogs = (): Promise<AuditLog[]> =>
+  api.get('/audit-logs').then(r => r.data)
+
+export const fetchBackupFiles = (): Promise<BackupFile[]> =>
+  api.get('/maintenance/backups').then(r => r.data)
+
+export const createBackup = (): Promise<BackupFile> =>
+  api.post('/maintenance/backup').then(r => r.data)
+
+export const pruneChecks = (days?: number): Promise<{ ok: boolean; days: number; cutoff: string; removed: number }> =>
+  api.post('/maintenance/prune', days ? { days } : {}).then(r => r.data)
+
+export const fetchHealth = (): Promise<HealthStatus> =>
+  axios.get('/health', { withCredentials: true, timeout: 10000, validateStatus: () => true }).then(r => r.data)
+
+export const fetchReady = (): Promise<HealthStatus> =>
+  axios.get('/ready', { withCredentials: true, timeout: 10000, validateStatus: () => true }).then(r => r.data)
 
 export const exportDomainsCsvUrl = (params?: DomainListParams): string => {
   const search = new URLSearchParams()

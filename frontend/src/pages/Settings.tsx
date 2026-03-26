@@ -2,13 +2,15 @@ import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { LucideIcon } from 'lucide-react'
 import { Save, Activity, Bell, Clock, Shield, Lock, SlidersHorizontal, Globe, Users } from 'lucide-react'
-import { createUser, deleteUserAccount, fetchConfig, fetchNotificationStatus, fetchUsers, testNotifications, updateConfig, updateUserAccount } from '../api/client'
-import type { AppConfig, AuthMe, NotificationTestResult, UserAccount, UserWritePayload } from '../types'
+import { createBackup, createUser, deleteUserAccount, fetchAuditLogs, fetchBackupFiles, fetchConfig, fetchHealth, fetchNotificationStatus, fetchReady, fetchUsers, pruneChecks, testNotifications, updateConfig, updateUserAccount } from '../api/client'
+import type { AppConfig, AuditLog, AuthMe, BackupFile, NotificationChannel, NotificationTestRequest, NotificationTestResult, UserAccount, UserWritePayload } from '../types'
 import CollapsiblePanel from '../components/CollapsiblePanel'
 import CustomFieldManager from '../components/CustomFieldManager'
 import NotificationSetupWizard from '../components/NotificationSetupWizard'
+import SecretInput from '../components/SecretInput'
 import { ListCardSkeleton, PageHeadingSkeleton, TableSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/ToastProvider'
+import { getErrorMessage } from '../lib/utils'
 import { UI_BUILD_ID, UI_VERSION } from '../version'
 
 function Section({ title, icon: Icon, children, defaultOpen = false }: {
@@ -110,21 +112,57 @@ const STATUS_POLICY_PRESETS: Array<{
   },
 ]
 
+function normalizeConfigArrays(config: AppConfig): AppConfig {
+  return {
+    ...config,
+    warnings: config.warnings ?? [],
+    server: {
+      ...config.server,
+      allowed_origins: config.server.allowed_origins ?? [],
+    },
+    notifications: {
+      ...config.notifications,
+      email: {
+        ...config.notifications.email,
+        to: config.notifications.email.to ?? [],
+      },
+    },
+    dns: {
+      ...config.dns,
+      servers: config.dns.servers ?? [],
+    },
+    prometheus: {
+      ...config.prometheus,
+      labels: {
+        ...config.prometheus.labels,
+        metadata_keys: config.prometheus.labels.metadata_keys ?? [],
+      },
+    },
+  }
+}
+
 export default function SettingsPage({ me }: SettingsPageProps) {
   const qc = useQueryClient()
   const { showToast } = useToast()
   const { data, isLoading } = useQuery({ queryKey: ['config'], queryFn: fetchConfig })
   const { data: users = [] } = useQuery({ queryKey: ['users'], queryFn: fetchUsers })
   const { data: notificationStatus = [] } = useQuery({ queryKey: ['notification-status'], queryFn: fetchNotificationStatus })
+  const { data: auditLogs = [] } = useQuery({ queryKey: ['audit-logs'], queryFn: fetchAuditLogs })
+  const { data: backupFiles = [] } = useQuery({ queryKey: ['backup-files'], queryFn: fetchBackupFiles })
+  const { data: health } = useQuery({ queryKey: ['health'], queryFn: fetchHealth, refetchInterval: 30000 })
+  const { data: readiness } = useQuery({ queryKey: ['readiness'], queryFn: fetchReady, refetchInterval: 30000 })
   const [form, setForm] = useState<AppConfig | null>(null)
   const [saved, setSaved] = useState(false)
   const [newUser, setNewUser] = useState<UserWritePayload>({ username: '', role: 'viewer', enabled: true, password: '' })
   const [editableUsers, setEditableUsers] = useState<EditableUser[]>([])
   const [notificationTestResults, setNotificationTestResults] = useState<NotificationTestResult[]>([])
+  const [pruneDays, setPruneDays] = useState(30)
 
   useEffect(() => {
     if (data) {
-      setForm(data)
+      const normalized = normalizeConfigArrays(data)
+      setForm(normalized)
+      setPruneDays(normalized.maintenance.check_retention_days > 0 ? normalized.maintenance.check_retention_days : 30)
     }
   }, [data])
 
@@ -135,13 +173,14 @@ export default function SettingsPage({ me }: SettingsPageProps) {
   const mutation = useMutation({
     mutationFn: (payload: Partial<AppConfig>) => updateConfig(payload),
     onSuccess: (next) => {
-      setForm(next)
+      setForm(normalizeConfigArrays(next))
       qc.invalidateQueries({ queryKey: ['bootstrap'] })
+      qc.invalidateQueries({ queryKey: ['audit-logs'] })
       setSaved(true)
       showToast({ tone: 'success', text: 'Settings saved successfully.' })
       setTimeout(() => setSaved(false), 2500)
     },
-    onError: (err: Error) => showToast({ tone: 'error', text: err.message || 'Failed to save settings.' }),
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to save settings.') }),
   })
 
   const createUserMutation = useMutation({
@@ -149,31 +188,34 @@ export default function SettingsPage({ me }: SettingsPageProps) {
     onSuccess: () => {
       setNewUser({ username: '', role: 'viewer', enabled: true, password: '' })
       qc.invalidateQueries({ queryKey: ['users'] })
+      qc.invalidateQueries({ queryKey: ['audit-logs'] })
       showToast({ tone: 'success', text: 'User created.' })
     },
-    onError: (err: Error) => showToast({ tone: 'error', text: err.message || 'Failed to create user.' }),
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to create user.') }),
   })
 
   const updateUserMutation = useMutation({
     mutationFn: ({ id, payload }: { id: number; payload: Partial<UserWritePayload> }) => updateUserAccount(id, payload),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['users'] })
+      qc.invalidateQueries({ queryKey: ['audit-logs'] })
       showToast({ tone: 'success', text: 'User updated.' })
     },
-    onError: (err: Error) => showToast({ tone: 'error', text: err.message || 'Failed to update user.' }),
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to update user.') }),
   })
 
   const deleteUserMutation = useMutation({
     mutationFn: deleteUserAccount,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['users'] })
+      qc.invalidateQueries({ queryKey: ['audit-logs'] })
       showToast({ tone: 'success', text: 'User deleted.' })
     },
-    onError: (err: Error) => showToast({ tone: 'error', text: err.message || 'Failed to delete user.' }),
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to delete user.') }),
   })
 
   const notificationTestMutation = useMutation({
-    mutationFn: testNotifications,
+    mutationFn: (payload: NotificationTestRequest) => testNotifications(payload),
     onSuccess: (results) => {
       setNotificationTestResults(results)
       qc.invalidateQueries({ queryKey: ['notification-status'] })
@@ -183,7 +225,24 @@ export default function SettingsPage({ me }: SettingsPageProps) {
         text: failed.length > 0 ? 'Some test notifications failed. Review channel status below.' : 'Test notifications sent successfully.',
       })
     },
-    onError: (err: Error) => showToast({ tone: 'error', text: err.message || 'Failed to send test notifications.' }),
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to send test notifications.') }),
+  })
+  const backupMutation = useMutation({
+    mutationFn: createBackup,
+    onSuccess: (file) => {
+      qc.invalidateQueries({ queryKey: ['backup-files'] })
+      qc.invalidateQueries({ queryKey: ['audit-logs'] })
+      showToast({ tone: 'success', text: `Backup created: ${file.name}` })
+    },
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to create backup.') }),
+  })
+  const pruneMutation = useMutation({
+    mutationFn: (days: number) => pruneChecks(days),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ['audit-logs'] })
+      showToast({ tone: 'success', text: `Removed ${result.removed} historical checks.` })
+    },
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to prune historical checks.') }),
   })
   const enabledAdminCount = useMemo(
     () => editableUsers.filter(user => user.enabled && user.role === 'admin').length,
@@ -204,7 +263,7 @@ export default function SettingsPage({ me }: SettingsPageProps) {
   }
 
   const save = () => mutation.mutate(form)
-  const activePreset = STATUS_POLICY_PRESETS.find(preset => JSON.stringify(preset.value) === JSON.stringify(form.status_policy))?.key
+  const activePreset = STATUS_POLICY_PRESETS.find(preset => matchesStatusPolicy(preset.value, form.status_policy))?.key
   const applyStatusPreset = (presetKey: (typeof STATUS_POLICY_PRESETS)[number]['key']) => {
     const preset = STATUS_POLICY_PRESETS.find(item => item.key === presetKey)
     if (!preset) return
@@ -232,6 +291,17 @@ export default function SettingsPage({ me }: SettingsPageProps) {
         </button>
       </div>
 
+      {form.warnings && form.warnings.length > 0 && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <div className="font-medium">Deployment warnings</div>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-amber-50/90">
+            {form.warnings.map(warning => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <Section title="Checker" icon={Clock} defaultOpen>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <Field label="Database path" hint="SQLite file path" restart>
@@ -249,6 +319,10 @@ export default function SettingsPage({ me }: SettingsPageProps) {
           <Field label="Concurrent checks" restart>
             <input className="input" type="number" min={1} max={50} value={form.checker.concurrent_checks}
               onChange={e => setForm(f => f ? ({ ...f, checker: { ...f.checker, concurrent_checks: Number(e.target.value) } }) : f)} />
+          </Field>
+          <Field label="Retry count" hint="Immediate retries for transient check failures within a single run">
+            <input className="input" type="number" min={0} max={10} value={form.checker.retry_count}
+              onChange={e => setForm(f => f ? ({ ...f, checker: { ...f.checker, retry_count: Number(e.target.value) } }) : f)} />
           </Field>
         </div>
       </Section>
@@ -366,7 +440,11 @@ export default function SettingsPage({ me }: SettingsPageProps) {
           notificationStatus={notificationStatus}
           notificationTestResults={notificationTestResults}
           testing={notificationTestMutation.isPending}
-          onSendTest={() => notificationTestMutation.mutate()}
+          onSendTest={(channel: NotificationChannel) => notificationTestMutation.mutate({
+            channel,
+            features: { notifications: form.features.notifications },
+            notifications: form.notifications,
+          })}
         />
       </Section>
 
@@ -391,12 +469,18 @@ export default function SettingsPage({ me }: SettingsPageProps) {
               onChange={e => setForm(f => f ? ({ ...f, auth: { ...f.auth, username: e.target.value } }) : f)} />
           </Field>
           <Field label="Legacy admin password">
-            <input className="input" type="password" value={form.auth.password}
-              onChange={e => setForm(f => f ? ({ ...f, auth: { ...f.auth, password: e.target.value } }) : f)} />
+            <SecretInput
+              value={form.auth.password}
+              ariaLabel="Legacy admin password"
+              onChange={value => setForm(f => f ? ({ ...f, auth: { ...f.auth, password: value } }) : f)}
+            />
           </Field>
           <Field label="API key">
-            <input className="input" value={form.auth.api_key}
-              onChange={e => setForm(f => f ? ({ ...f, auth: { ...f.auth, api_key: e.target.value } }) : f)} />
+            <SecretInput
+              value={form.auth.api_key}
+              ariaLabel="API key"
+              onChange={value => setForm(f => f ? ({ ...f, auth: { ...f.auth, api_key: value } }) : f)}
+            />
           </Field>
           <Field label="Session TTL" hint="e.g. 12h, 24h, 168h">
             <input className="input" value={form.auth.session_ttl}
@@ -417,6 +501,39 @@ export default function SettingsPage({ me }: SettingsPageProps) {
           <Field label="Protect UI routes" hint="When enabled, anonymous users will see the login gate">
             <BoolSelect value={form.auth.protect_ui}
               onChange={v => setForm(f => f ? ({ ...f, auth: { ...f.auth, protect_ui: v } }) : f)} />
+          </Field>
+        </div>
+      </Section>
+
+      <Section title="Request Safety" icon={Shield}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="CSRF protection" hint="Applies to cookie-based session writes in the browser">
+            <BoolSelect value={form.security.csrf_enabled}
+              onChange={v => setForm(f => f ? ({ ...f, security: { ...f.security, csrf_enabled: v } }) : f)} />
+          </Field>
+          <Field label="Soft rate limiting" hint="Targets login and admin write endpoints only">
+            <BoolSelect value={form.security.rate_limit_enabled}
+              onChange={v => setForm(f => f ? ({ ...f, security: { ...f.security, rate_limit_enabled: v } }) : f)} />
+          </Field>
+          <Field label="Login requests" hint="Per-IP limit for /session/login within the login window">
+            <input className="input" type="number" min={1} value={form.security.login_requests}
+              onChange={e => setForm(f => f ? ({ ...f, security: { ...f.security, login_requests: Number(e.target.value) } }) : f)} />
+          </Field>
+          <Field label="Login window" hint="e.g. 5m, 15m">
+            <input className="input" value={form.security.login_window}
+              onChange={e => setForm(f => f ? ({ ...f, security: { ...f.security, login_window: e.target.value } }) : f)} />
+          </Field>
+          <Field label="Admin write requests" hint="Per-user/IP limit for POST/PUT/DELETE admin actions">
+            <input className="input" type="number" min={1} value={form.security.admin_write_requests}
+              onChange={e => setForm(f => f ? ({ ...f, security: { ...f.security, admin_write_requests: Number(e.target.value) } }) : f)} />
+          </Field>
+          <Field label="Admin window" hint="e.g. 1m, 5m">
+            <input className="input" value={form.security.admin_window}
+              onChange={e => setForm(f => f ? ({ ...f, security: { ...f.security, admin_window: e.target.value } }) : f)} />
+          </Field>
+          <Field label="Allowed UI origins" hint="Comma-separated origins for split UI/API deployments. Empty keeps CORS same-origin only.">
+            <input className="input" value={(form.server.allowed_origins ?? []).join(', ')}
+              onChange={e => setForm(f => f ? ({ ...f, server: { ...f.server, allowed_origins: e.target.value.split(',').map(s => s.trim()).filter(Boolean) } }) : f)} />
           </Field>
         </div>
       </Section>
@@ -468,15 +585,144 @@ export default function SettingsPage({ me }: SettingsPageProps) {
             <input className="input" value={form.prometheus.path}
               onChange={e => setForm(f => f ? ({ ...f, prometheus: { ...f.prometheus, path: e.target.value } }) : f)} />
           </Field>
+          <Field label="Export tag labels" hint="Leave enabled to keep domain_tag_info for every domain/tag pair">
+            <BoolSelect value={form.prometheus.labels.export_tags}
+              onChange={v => setForm(f => f ? ({ ...f, prometheus: { ...f.prometheus, labels: { ...f.prometheus.labels, export_tags: v } } }) : f)} />
+          </Field>
+          <Field label="Export metadata labels" hint="Default stays permissive. Disable or whitelist keys only if Prometheus cardinality becomes a problem">
+            <BoolSelect value={form.prometheus.labels.export_metadata}
+              onChange={v => setForm(f => f ? ({ ...f, prometheus: { ...f.prometheus, labels: { ...f.prometheus.labels, export_metadata: v } } }) : f)} />
+          </Field>
+          <Field label="Metadata key allowlist" hint="Comma-separated. Empty means export all metadata keys.">
+            <input className="input" value={(form.prometheus.labels.metadata_keys ?? []).join(', ')}
+              onChange={e => setForm(f => f ? ({ ...f, prometheus: { ...f.prometheus, labels: { ...f.prometheus.labels, metadata_keys: e.target.value.split(',').map(s => s.trim()).filter(Boolean) } } }) : f)} />
+          </Field>
           <Field label="JSON logs" restart><BoolSelect value={form.logging.json}
             onChange={v => setForm(f => f ? ({ ...f, logging: { ...f.logging, json: v } }) : f)} /></Field>
         </div>
       </Section>
 
+      <Section title="Maintenance & Health" icon={Activity}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="Backups directory" hint="Used by admin-triggered sqlite backups and CLI backup workflows">
+            <input className="input" value={form.maintenance.backups_dir}
+              onChange={e => setForm(f => f ? ({ ...f, maintenance: { ...f.maintenance, backups_dir: e.target.value } }) : f)} />
+          </Field>
+          <Field label="Check retention days" hint="0 keeps all history forever">
+            <input className="input" type="number" min={0} value={form.maintenance.check_retention_days}
+              onChange={e => setForm(f => f ? ({ ...f, maintenance: { ...f.maintenance, check_retention_days: Number(e.target.value) } }) : f)} />
+          </Field>
+          <Field label="Audit retention days" hint="0 keeps audit history forever">
+            <input className="input" type="number" min={0} value={form.maintenance.audit_retention_days}
+              onChange={e => setForm(f => f ? ({ ...f, maintenance: { ...f.maintenance, audit_retention_days: Number(e.target.value) } }) : f)} />
+          </Field>
+          <Field label="Retention sweep interval" hint="e.g. 24h">
+            <input className="input" value={form.maintenance.retention_sweep_interval}
+              onChange={e => setForm(f => f ? ({ ...f, maintenance: { ...f.maintenance, retention_sweep_interval: e.target.value } }) : f)} />
+          </Field>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {[{ title: 'Health', payload: health }, { title: 'Readiness', payload: readiness }].map(item => (
+            <div key={item.title} className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-white">{item.title}</div>
+                <span className={`rounded-full px-2 py-1 text-[11px] ${item.payload?.status === 'ok' ? 'bg-emerald-500/10 text-emerald-300' : 'bg-amber-500/10 text-amber-300'}`}>
+                  {item.payload?.status ?? 'unknown'}
+                </span>
+              </div>
+              <div className="text-xs text-slate-400">Database: <span className="text-slate-200">{item.payload?.database ?? 'loading'}</span></div>
+              <div className="text-xs text-slate-400">Scheduler: <span className="text-slate-200">{item.payload?.scheduler.started ? 'running' : 'not ready'}</span></div>
+              <div className="text-xs text-slate-500">In flight checks: {item.payload?.scheduler.in_flight ?? 0}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-[0.95fr_1.05fr] gap-6">
+          <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 space-y-3">
+            <div className="text-sm font-semibold text-white">Run maintenance</div>
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="min-w-[180px] flex-1">
+                <Field label="Manual prune horizon">
+                  <input className="input" type="number" min={1} value={pruneDays} onChange={e => setPruneDays(Number(e.target.value))} />
+                </Field>
+              </div>
+              <button className="btn-primary" onClick={() => backupMutation.mutate()} disabled={backupMutation.isPending}>
+                {backupMutation.isPending ? 'Creating backup...' : 'Create backup'}
+              </button>
+              <button className="btn-ghost border border-slate-700" onClick={() => pruneMutation.mutate(pruneDays)} disabled={pruneMutation.isPending}>
+                {pruneMutation.isPending ? 'Pruning...' : 'Prune history'}
+              </button>
+            </div>
+            <div className="text-xs text-slate-400">
+              Runtime restore is intentionally not exposed in the UI. Use the CLI <code>-restore</code> flow during maintenance windows.
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 space-y-3">
+            <div className="text-sm font-semibold text-white">Recent backups</div>
+            {backupFiles.length === 0 ? (
+              <div className="text-sm text-slate-400">No backup files found yet.</div>
+            ) : (
+              <div className="space-y-2">
+                {backupFiles.slice(0, 6).map((file: BackupFile) => (
+                  <div key={file.path} className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+                    <div className="font-medium text-white">{file.name}</div>
+                    <div className="mt-1 break-all text-slate-500">{file.path}</div>
+                    <div className="mt-1 text-slate-500">{new Date(file.modified_at).toLocaleString()} | {(file.size_bytes / 1024 / 1024).toFixed(2)} MB</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </Section>
+
+      <Section title="Audit Log" icon={Activity}>
+        <div className="rounded-xl border border-slate-800 bg-slate-900/40 overflow-hidden">
+          {auditLogs.length === 0 ? (
+            <div className="p-4 text-sm text-slate-400">No audit events recorded yet.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-slate-950/70 text-slate-400">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">When</th>
+                    <th className="px-4 py-3 font-medium">Actor</th>
+                    <th className="px-4 py-3 font-medium">Action</th>
+                    <th className="px-4 py-3 font-medium">Summary</th>
+                    <th className="px-4 py-3 font-medium">Request ID</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {auditLogs.slice(0, 50).map((entry: AuditLog) => (
+                    <tr key={entry.id} className="border-t border-slate-800 text-slate-300">
+                      <td className="px-4 py-3 align-top text-xs text-slate-400">{new Date(entry.created_at).toLocaleString()}</td>
+                      <td className="px-4 py-3 align-top">
+                        <div className="font-medium text-white">{entry.actor_username || 'anonymous'}</div>
+                        <div className="text-xs text-slate-500">{entry.actor_role} via {entry.actor_source}</div>
+                      </td>
+                      <td className="px-4 py-3 align-top text-xs uppercase tracking-wide text-slate-400">{entry.resource}.{entry.action}</td>
+                      <td className="px-4 py-3 align-top">
+                        <div>{entry.summary}</div>
+                        {entry.details && Object.keys(entry.details).length > 0 && (
+                          <pre className="mt-2 overflow-auto rounded bg-slate-950/70 p-2 text-[11px] text-slate-400">{JSON.stringify(entry.details, null, 2)}</pre>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 align-top text-xs text-slate-500">{entry.request_id}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </Section>
+
       <Section title="Local Users & Roles" icon={Users}>
         <div className="rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3 text-xs text-slate-400">
-          Keep at least one enabled <code>admin</code> account at all times. The backend blocks removing the last enabled admin, and the UI highlights this state before save.
-          <div className="mt-2 text-slate-300">Enabled admins currently configured: {enabledAdminCount}</div>
+          Keep at least one enabled <code>admin</code> account at all times. The backend blocks removing the last enabled admin, and the UI highlights the current draft before save.
+          <div className="mt-2 text-slate-300">Enabled admins in current draft: {enabledAdminCount}</div>
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-6">
           <div className="space-y-3">
@@ -535,7 +781,7 @@ export default function SettingsPage({ me }: SettingsPageProps) {
                           password: user.password?.trim() || undefined,
                         },
                       })}
-                      disabled={enabledAdminCount === 0}
+                      disabled={wouldLeaveNoEnabledAdmins(users, user)}
                     >
                       Save user
                     </button>
@@ -587,4 +833,24 @@ export default function SettingsPage({ me }: SettingsPageProps) {
       </Section>
     </div>
   )
+}
+
+function matchesStatusPolicy(a: AppConfig['status_policy'], b: AppConfig['status_policy']): boolean {
+  return a.badge_on_invalid_chain === b.badge_on_invalid_chain &&
+    a.badge_on_self_signed === b.badge_on_self_signed &&
+    a.badge_on_http_probe_error === b.badge_on_http_probe_error &&
+    a.badge_on_http_client_error === b.badge_on_http_client_error &&
+    a.badge_on_cipher_warning === b.badge_on_cipher_warning &&
+    a.badge_on_ocsp_unknown === b.badge_on_ocsp_unknown &&
+    a.badge_on_crl_unknown === b.badge_on_crl_unknown &&
+    a.badge_on_caa_missing === b.badge_on_caa_missing &&
+    a.badge_on_domain_lookup_error === b.badge_on_domain_lookup_error
+}
+
+function wouldLeaveNoEnabledAdmins(users: UserAccount[], draft: EditableUser): boolean {
+  const resultingAdmins = users.filter(user => {
+    const effective = user.id === draft.id ? draft : user
+    return effective.enabled && effective.role === 'admin'
+  }).length
+  return resultingAdmins === 0
 }

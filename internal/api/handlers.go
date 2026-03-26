@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,16 @@ import (
 	"ssl-domain-exporter/internal/db"
 	"ssl-domain-exporter/internal/metrics"
 )
+
+type notificationTestRequest struct {
+	Channel       string                       `json:"channel"`
+	Features      *notificationFeatureOverride `json:"features,omitempty"`
+	Notifications *config.NotificationsConfig  `json:"notifications,omitempty"`
+}
+
+type notificationFeatureOverride struct {
+	Notifications bool `json:"notifications"`
+}
 
 type Handler struct {
 	cfg       *config.Config
@@ -98,6 +109,13 @@ func (h *Handler) CreateDomain(c *gin.Context) {
 
 	if dom != nil && dom.Enabled && h.scheduler != nil {
 		h.scheduler.TriggerCheck(dom)
+	}
+	if dom != nil {
+		h.audit(c, "create", "domain", &dom.ID, "Created domain", map[string]any{
+			"name":       dom.Name,
+			"enabled":    dom.Enabled,
+			"check_mode": dom.CheckMode,
+		})
 	}
 	c.JSON(http.StatusCreated, dom)
 }
@@ -230,6 +248,14 @@ func (h *Handler) UpdateDomain(c *gin.Context) {
 	if needsRecheck && dom != nil && dom.Enabled && h.scheduler != nil {
 		h.scheduler.TriggerCheck(dom)
 	}
+	if dom != nil {
+		h.audit(c, "update", "domain", &dom.ID, "Updated domain", map[string]any{
+			"before_name": current.Name,
+			"after_name":  dom.Name,
+			"enabled":     dom.Enabled,
+			"check_mode":  dom.CheckMode,
+		})
+	}
 
 	c.JSON(http.StatusOK, dom)
 }
@@ -254,7 +280,8 @@ func (h *Handler) ImportDomains(c *gin.Context) {
 	cfg := h.cfg.Snapshot()
 	defaults, err := parseImportMap(req.Defaults, false)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("defaults: %v", err)})
+		wrapped := fmt.Errorf("defaults: %w", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": wrapped.Error()})
 		return
 	}
 	if !defaults.HasCheckMode {
@@ -411,6 +438,16 @@ func (h *Handler) ImportDomains(c *gin.Context) {
 	if h.metrics != nil && !req.DryRun {
 		h.refreshTotalDomainsMetric()
 	}
+	if !req.DryRun {
+		h.audit(c, "import", "domain", nil, "Imported domain batch", map[string]any{
+			"mode":    resp.Mode,
+			"created": resp.Summary.Created,
+			"updated": resp.Summary.Updated,
+			"failed":  resp.Summary.Failed,
+			"skipped": resp.Summary.Skipped,
+			"total":   resp.Summary.Total,
+		})
+	}
 
 	c.JSON(http.StatusOK, resp)
 }
@@ -425,6 +462,10 @@ func (h *Handler) DeleteDomain(c *gin.Context) {
 
 	// Fetch domain name before deletion so we can clean up metrics
 	dom, _ := h.db.GetDomainByID(id)
+	if dom == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
 
 	if err := h.db.DeleteDomain(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -434,6 +475,11 @@ func (h *Handler) DeleteDomain(c *gin.Context) {
 	if dom != nil && h.metrics != nil {
 		h.metrics.CleanupDomain(dom.Name)
 		h.refreshTotalDomainsMetric()
+	}
+	if dom != nil {
+		h.audit(c, "delete", "domain", &dom.ID, "Deleted domain", map[string]any{
+			"name": dom.Name,
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -474,8 +520,37 @@ func (h *Handler) TriggerCheck(c *gin.Context) {
 		return
 	}
 
-	result := h.checker.CheckDomain(dom)
-	c.JSON(http.StatusOK, result)
+	if h.scheduler == nil {
+		result := h.checker.CheckDomain(dom)
+		h.audit(c, "trigger_check", "domain", &dom.ID, "Triggered immediate domain check", map[string]any{
+			"name":   dom.Name,
+			"mode":   "inline",
+			"status": result.OverallStatus,
+		})
+		c.JSON(http.StatusOK, result)
+		return
+	}
+
+	accepted := h.scheduler.TriggerCheck(dom)
+	if !accepted {
+		c.JSON(http.StatusAccepted, gin.H{
+			"accepted":        false,
+			"already_running": true,
+			"domain_id":       dom.ID,
+			"name":            dom.Name,
+		})
+		return
+	}
+	h.audit(c, "trigger_check", "domain", &dom.ID, "Queued manual domain check", map[string]any{
+		"name": dom.Name,
+		"mode": "async",
+	})
+	c.JSON(http.StatusAccepted, gin.H{
+		"accepted":        true,
+		"already_running": false,
+		"domain_id":       dom.ID,
+		"name":            dom.Name,
+	})
 }
 
 // GET /api/folders
@@ -525,6 +600,9 @@ func (h *Handler) CreateFolder(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.audit(c, "create", "folder", &folder.ID, "Created folder", map[string]any{
+		"name": folder.Name,
+	})
 	c.JSON(http.StatusCreated, folder)
 }
 
@@ -563,6 +641,9 @@ func (h *Handler) UpdateFolder(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
+	h.audit(c, "update", "folder", &folder.ID, "Updated folder", map[string]any{
+		"name": folder.Name,
+	})
 	c.JSON(http.StatusOK, folder)
 }
 
@@ -577,6 +658,7 @@ func (h *Handler) DeleteFolder(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.audit(c, "delete", "folder", &id, "Deleted folder", nil)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -747,7 +829,7 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 
 // GET /api/config
 func (h *Handler) GetConfig(c *gin.Context) {
-	c.JSON(http.StatusOK, h.cfg.Snapshot())
+	c.JSON(http.StatusOK, h.cfg.RedactedSnapshot())
 }
 
 // PUT /api/config
@@ -758,19 +840,29 @@ func (h *Handler) UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	next := h.cfg.Snapshot()
+	current := h.cfg.Snapshot()
+	next := current.Clone()
 	if err := json.Unmarshal(body, next); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	next.RestoreRedactedSecrets(current)
+	if err := next.Validate(); err != nil {
+		writeConfigValidationError(c, err)
 		return
 	}
 
 	h.cfg.ApplyFrom(next)
 	if err := h.cfg.Save(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save config: %v", err)})
+		wrapped := fmt.Errorf("save config: %w", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": wrapped.Error()})
 		return
 	}
+	h.audit(c, "update", "config", nil, "Updated application config", map[string]any{
+		"sections": changedConfigSections(current, next),
+	})
 
-	c.JSON(http.StatusOK, h.cfg.Snapshot())
+	c.JSON(http.StatusOK, h.cfg.RedactedSnapshot())
 }
 
 // GET /api/notifications/status
@@ -792,7 +884,42 @@ func (h *Handler) TestNotifications(c *gin.Context) {
 		c.JSON(http.StatusOK, []checker.TestResult{})
 		return
 	}
-	results := h.checker.SendTestNotifications()
+
+	var req notificationTestRequest
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		return
+	}
+	if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
+		if err := json.Unmarshal(body, &req); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	current := h.cfg.Snapshot()
+	effective := current
+	if req.Features != nil || req.Notifications != nil {
+		effective = current.Clone()
+		if req.Features != nil {
+			effective.Features.Notifications = req.Features.Notifications
+		}
+		if req.Notifications != nil {
+			effective.Notifications = *req.Notifications
+		}
+		effective.RestoreRedactedSecrets(current)
+		if err := effective.ValidateNotificationsOnly(); err != nil {
+			writeConfigValidationError(c, err)
+			return
+		}
+	}
+
+	results, err := h.checker.SendTestNotifications(req.Channel, effective)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if results == nil {
 		results = []checker.TestResult{}
 	}
@@ -813,11 +940,11 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		"alert_ssl_expiry_warning":        cfg.Alerts.SSLExpiryWarningDays,
 		"alert_ssl_expiry_critical":       cfg.Alerts.SSLExpiryCriticalDays,
 		"notifications_enabled":           cfg.Features.Notifications,
-		"notifications_webhook_url":       cfg.Notifications.Webhook.URL,
+		"notifications_webhook_url":       redactLegacySecret(cfg.Notifications.Webhook.URL),
 		"webhook_on_critical":             cfg.Notifications.Webhook.OnCritical,
 		"webhook_on_warning":              cfg.Notifications.Webhook.OnWarning,
 		"telegram_enabled":                cfg.Notifications.Telegram.Enabled,
-		"telegram_bot_token":              cfg.Notifications.Telegram.BotToken,
+		"telegram_bot_token":              redactLegacySecret(cfg.Notifications.Telegram.BotToken),
 		"telegram_chat_id":                cfg.Notifications.Telegram.ChatID,
 		"telegram_on_critical":            cfg.Notifications.Telegram.OnCritical,
 		"telegram_on_warning":             cfg.Notifications.Telegram.OnWarning,
@@ -856,73 +983,184 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		case "checker_timeout":
 			cfg.Checker.Timeout = v
 		case "checker_concurrent_checks":
-			if n, err := strconv.Atoi(v); err == nil {
-				cfg.Checker.ConcurrentChecks = n
+			n, err := parseCompatInt(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
 			}
+			cfg.Checker.ConcurrentChecks = n
 		case "prometheus_enabled":
-			cfg.Prometheus.Enabled = config.ParseBool(v)
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Prometheus.Enabled = b
 		case "prometheus_path":
 			cfg.Prometheus.Path = v
 		case "alert_domain_expiry_warning":
-			if n, err := strconv.Atoi(v); err == nil {
-				cfg.Alerts.DomainExpiryWarningDays = n
+			n, err := parseCompatInt(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
 			}
+			cfg.Alerts.DomainExpiryWarningDays = n
 		case "alert_domain_expiry_critical":
-			if n, err := strconv.Atoi(v); err == nil {
-				cfg.Alerts.DomainExpiryCriticalDays = n
+			n, err := parseCompatInt(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
 			}
+			cfg.Alerts.DomainExpiryCriticalDays = n
 		case "alert_ssl_expiry_warning":
-			if n, err := strconv.Atoi(v); err == nil {
-				cfg.Alerts.SSLExpiryWarningDays = n
+			n, err := parseCompatInt(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
 			}
+			cfg.Alerts.SSLExpiryWarningDays = n
 		case "alert_ssl_expiry_critical":
-			if n, err := strconv.Atoi(v); err == nil {
-				cfg.Alerts.SSLExpiryCriticalDays = n
+			n, err := parseCompatInt(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
 			}
+			cfg.Alerts.SSLExpiryCriticalDays = n
 		case "notifications_enabled":
-			cfg.Features.Notifications = config.ParseBool(v)
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.Notifications = b
 		case "notifications_webhook_url":
-			cfg.Notifications.Webhook.URL = v
+			if strings.TrimSpace(v) == config.RedactedSecret {
+				cfg.Notifications.Webhook.URL = h.cfg.Snapshot().Notifications.Webhook.URL
+			} else {
+				cfg.Notifications.Webhook.URL = v
+			}
 		case "webhook_on_critical":
-			cfg.Notifications.Webhook.OnCritical = config.ParseBool(v)
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Notifications.Webhook.OnCritical = b
 		case "webhook_on_warning":
-			cfg.Notifications.Webhook.OnWarning = config.ParseBool(v)
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Notifications.Webhook.OnWarning = b
 		case "telegram_enabled":
-			cfg.Notifications.Telegram.Enabled = config.ParseBool(v)
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Notifications.Telegram.Enabled = b
 		case "telegram_bot_token":
-			cfg.Notifications.Telegram.BotToken = v
+			if strings.TrimSpace(v) == config.RedactedSecret {
+				cfg.Notifications.Telegram.BotToken = h.cfg.Snapshot().Notifications.Telegram.BotToken
+			} else {
+				cfg.Notifications.Telegram.BotToken = v
+			}
 		case "telegram_chat_id":
 			cfg.Notifications.Telegram.ChatID = v
 		case "telegram_on_critical":
-			cfg.Notifications.Telegram.OnCritical = config.ParseBool(v)
-		case "telegram_on_warning":
-			cfg.Notifications.Telegram.OnWarning = config.ParseBool(v)
-		case "feature_http_check":
-			cfg.Features.HTTPCheck = config.ParseBool(v)
-		case "feature_cipher_check":
-			cfg.Features.CipherCheck = config.ParseBool(v)
-		case "feature_ocsp_check":
-			cfg.Features.OCSPCheck = config.ParseBool(v)
-		case "feature_crl_check":
-			cfg.Features.CRLCheck = config.ParseBool(v)
-		case "feature_caa_check":
-			cfg.Features.CAACheck = config.ParseBool(v)
-		case "feature_csv_export":
-			cfg.Features.CSVExport = config.ParseBool(v)
-		case "feature_timeline_view":
-			cfg.Features.TimelineView = config.ParseBool(v)
-		case "feature_dashboard_tag_filter":
-			cfg.Features.DashboardTagFilter = config.ParseBool(v)
-		case "feature_structured_logs":
-			cfg.Features.StructuredLogs = config.ParseBool(v)
-		case "domain_subdomain_fallback":
-			cfg.Domains.SubdomainFallback = config.ParseBool(v)
-		case "domain_subdomain_fallback_depth":
-			if n, err := strconv.Atoi(v); err == nil {
-				cfg.Domains.FallbackDepth = n
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
 			}
+			cfg.Notifications.Telegram.OnCritical = b
+		case "telegram_on_warning":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Notifications.Telegram.OnWarning = b
+		case "feature_http_check":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.HTTPCheck = b
+		case "feature_cipher_check":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.CipherCheck = b
+		case "feature_ocsp_check":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.OCSPCheck = b
+		case "feature_crl_check":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.CRLCheck = b
+		case "feature_caa_check":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.CAACheck = b
+		case "feature_csv_export":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.CSVExport = b
+		case "feature_timeline_view":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.TimelineView = b
+		case "feature_dashboard_tag_filter":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.DashboardTagFilter = b
+		case "feature_structured_logs":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Features.StructuredLogs = b
+		case "domain_subdomain_fallback":
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Domains.SubdomainFallback = b
+		case "domain_subdomain_fallback_depth":
+			n, err := parseCompatInt(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.Domains.FallbackDepth = n
 		case "domain_default_check_mode":
-			cfg.Domains.DefaultCheckMode = config.ValidateCheckMode(v)
+			cfg.Domains.DefaultCheckMode = v
 		case "dns_servers":
 			servers := []string{}
 			for _, s := range strings.Split(v, ",") {
@@ -933,18 +1171,37 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			}
 			cfg.DNS.Servers = servers
 		case "dns_use_system_dns":
-			cfg.DNS.UseSystemDNS = config.ParseBool(v)
+			b, err := parseCompatBool(k, v)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			cfg.DNS.UseSystemDNS = b
 		case "dns_timeout":
 			cfg.DNS.Timeout = v
 		case "notifications_timeout":
 			cfg.Notifications.Timeout = v
 		}
 	}
+	if err := cfg.Validate(); err != nil {
+		writeConfigValidationError(c, err)
+		return
+	}
 
 	h.cfg.ApplyFrom(cfg)
 	if err := h.cfg.Save(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save config: %v", err)})
+		wrapped := fmt.Errorf("save config: %w", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": wrapped.Error()})
 		return
+	}
+	if len(req) > 0 {
+		keys := make([]string, 0, len(req))
+		for key := range req {
+			keys = append(keys, key)
+		}
+		h.audit(c, "update", "config", nil, "Updated compatibility settings", map[string]any{
+			"keys": keys,
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -971,7 +1228,7 @@ func (h *Handler) GetSummary(c *gin.Context) {
 
 	for _, dom := range domains {
 		if chk, ok := lastChecks[dom.ID]; ok {
-			summary[chk.OverallStatus]++
+			summary[normalizeSummaryStatus(chk.OverallStatus)]++
 		} else {
 			summary["unknown"]++
 		}
@@ -994,6 +1251,15 @@ func normalizeDomain(name string) string {
 		}
 	}
 	return name
+}
+
+func normalizeSummaryStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "ok", "warning", "critical", "error":
+		return strings.ToLower(strings.TrimSpace(status))
+	default:
+		return "unknown"
+	}
 }
 
 func isDomainAlreadyExistsErr(err error) bool {

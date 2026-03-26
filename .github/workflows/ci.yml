@@ -10,6 +10,20 @@ on:
   pull_request:
 
 jobs:
+  backend-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: GolangCI-Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+          args: --timeout=5m
+
   backend:
     runs-on: ubuntu-latest
     steps:
@@ -45,11 +59,35 @@ jobs:
       - name: Frontend build
         run: npm run build
 
+  frontend-smoke:
+    runs-on: ubuntu-latest
+    needs:
+      - frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.17.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - name: Install root helpers
+        run: npm ci --ignore-scripts
+      - name: Install frontend
+        run: npm --prefix frontend ci
+      - name: Install Playwright Chromium
+        run: npm --prefix frontend exec playwright install --with-deps chromium
+      - name: Frontend smoke tests
+        run: npm run test:e2e
+
   release-hardening:
     runs-on: ubuntu-latest
     needs:
+      - backend-lint
       - backend
       - frontend
+      - frontend-smoke
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

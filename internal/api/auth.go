@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -126,13 +127,13 @@ func resolveSessionPrincipal(cfg *config.Config, database *db.DB, c *gin.Context
 		return Principal{}, false
 	}
 
-	user, session, err := database.GetUserBySessionTokenHash(hashSessionToken(rawToken))
+	user, session, err := database.GetUserBySessionTokenHash(hashSessionToken(cfg, rawToken))
 	if err != nil || user == nil || session == nil {
 		clearSessionCookie(c, cfg)
 		return Principal{}, false
 	}
 	if !user.Enabled || session.ExpiresAt.Before(time.Now()) {
-		_ = database.DeleteSession(hashSessionToken(rawToken))
+		_ = database.DeleteSession(hashSessionToken(cfg, rawToken))
 		clearSessionCookie(c, cfg)
 		return Principal{}, false
 	}
@@ -262,18 +263,33 @@ func validateAPIKey(cfg *config.Config, c *gin.Context) bool {
 			candidate = strings.TrimSpace(authz[7:])
 		}
 	}
-	if candidate == "" {
-		candidate = strings.TrimSpace(c.Query("api_key"))
-	}
 	return subtle.ConstantTimeCompare([]byte(candidate), []byte(cfg.Auth.APIKey)) == 1
 }
 
-func hashSessionToken(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
+func hashSessionToken(cfg *config.Config, raw string) string {
+	mac := hmac.New(sha256.New, sessionTokenHMACKey(cfg))
+	_, _ = mac.Write([]byte(raw))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func sessionTokenHMACKey(cfg *config.Config) []byte {
+	if cfg == nil {
+		return []byte("ssl-domain-exporter-session-token-v1")
+	}
+	parts := []string{
+		"ssl-domain-exporter-session-token-v1",
+		strings.TrimSpace(cfg.Auth.CookieName),
+		strings.TrimSpace(cfg.Auth.Username),
+		cfg.Auth.Password,
+		cfg.Auth.APIKey,
+		strings.TrimSpace(cfg.Database.Path),
+		strings.TrimSpace(cfg.FilePath()),
+	}
+	return []byte(strings.Join(parts, "\x00"))
 }
 
 func clearSessionCookie(c *gin.Context, cfg *config.Config) {
+	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(cookieName(cfg), "", -1, "/", "", cfg.Auth.CookieSecure, true)
 }
 
