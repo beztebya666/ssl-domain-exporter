@@ -292,9 +292,9 @@ export default function SettingsPage({ me }: SettingsPageProps) {
       </div>
 
       {form.warnings && form.warnings.length > 0 && (
-        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-          <div className="font-medium">Deployment warnings</div>
-          <ul className="mt-2 list-disc space-y-1 pl-5 text-amber-50/90">
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/15 px-4 py-3 text-sm text-amber-300">
+          <div className="font-medium text-amber-400">Deployment warnings</div>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-amber-300">
             {form.warnings.map(warning => (
               <li key={warning}>{warning}</li>
             ))}
