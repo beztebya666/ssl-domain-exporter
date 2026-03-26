@@ -312,6 +312,17 @@
     color: rgb(17 24 39);
   }
 
+  .theme-light .btn-primary,
+  .theme-light .btn-primary:hover,
+  .theme-light .btn-primary:focus-visible {
+    color: rgb(255 255 255);
+  }
+
+  .theme-light .bg-blue-500.text-white,
+  .theme-light .bg-blue-600.text-white {
+    color: rgb(255 255 255);
+  }
+
   /* ── Slate borders ── */
   .theme-light .border-slate-600 {
     border-color: rgb(209 213 219);
