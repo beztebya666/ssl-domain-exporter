@@ -195,6 +195,39 @@ func TestSyncDomainReplacesMetadataSeries(t *testing.T) {
 	}
 }
 
+func TestSyncDomainHonorsMetadataExportDisable(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cfg := config.Default()
+	cfg.Prometheus.Labels.ExportMetadata = false
+	m := NewWithConfigAndRegisterer(cfg, reg)
+
+	m.SyncDomain(&db.Domain{
+		Name:     "metadata.internal",
+		Metadata: map[string]string{"owner": "platform"},
+	})
+	if metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "owner", "value": "platform"}) {
+		t.Fatal("expected metadata export to stay disabled")
+	}
+}
+
+func TestSyncDomainHonorsMetadataKeyWhitelist(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cfg := config.Default()
+	cfg.Prometheus.Labels.MetadataKeys = []string{"env"}
+	m := NewWithConfigAndRegisterer(cfg, reg)
+
+	m.SyncDomain(&db.Domain{
+		Name:     "metadata.internal",
+		Metadata: map[string]string{"env": "prod", "owner_email": "ops@example.com"},
+	})
+	if !metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "env", "value": "prod"}) {
+		t.Fatal("expected allowlisted metadata series to exist")
+	}
+	if metricSeriesExists(t, reg, "domain_metadata_info", map[string]string{"domain": "metadata.internal", "key": "owner_email", "value": "ops@example.com"}) {
+		t.Fatal("expected non-allowlisted metadata series to be skipped")
+	}
+}
+
 func TestUpdateDomainMapsUnknownStatusSeparatelyFromError(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewWithRegisterer(reg)

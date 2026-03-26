@@ -27,7 +27,10 @@ func CheckHTTP(domain string, port int, timeout time.Duration, customCAPEM strin
 	}
 
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: roots},
+		TLSClientConfig: &tls.Config{
+			RootCAs:    roots,
+			MinVersion: tls.VersionTLS12,
+		},
 	}
 
 	// Use custom DNS resolver for HTTP connections if available

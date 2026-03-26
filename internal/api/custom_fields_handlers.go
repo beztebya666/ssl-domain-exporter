@@ -61,6 +61,11 @@ func (h *Handler) CreateCustomField(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	h.audit(c, "create", "custom_field", &field.ID, "Created custom field", map[string]any{
+		"key":   field.Key,
+		"label": field.Label,
+		"type":  field.Type,
+	})
 	c.JSON(http.StatusCreated, field)
 }
 
@@ -90,6 +95,11 @@ func (h *Handler) UpdateCustomField(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
+	h.audit(c, "update", "custom_field", &field.ID, "Updated custom field", map[string]any{
+		"key":   field.Key,
+		"label": field.Label,
+		"type":  field.Type,
+	})
 	c.JSON(http.StatusOK, field)
 }
 
@@ -103,6 +113,7 @@ func (h *Handler) DeleteCustomField(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.audit(c, "delete", "custom_field", &id, "Deleted custom field", nil)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

@@ -46,6 +46,7 @@ func CheckSSL(domain string, port int, timeout time.Duration, customCAPEM string
 	}
 
 	dialer := &net.Dialer{Timeout: timeout}
+	//nolint:gosec // The handshake must succeed even for invalid chains so the checker can inspect and report certificate problems itself.
 	conn, err := tls.DialWithDialer(dialer, "tcp", dialAddr, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         serverName,

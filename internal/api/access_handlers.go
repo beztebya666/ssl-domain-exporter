@@ -105,12 +105,13 @@ func (h *Handler) LoginSession(c *gin.Context) {
 		return
 	}
 	expiresAt := time.Now().Add(sessionTTL)
-	if _, err := h.db.CreateSession(user.ID, hashSessionToken(token), expiresAt, c.Request.UserAgent(), c.ClientIP()); err != nil {
+	if _, err := h.db.CreateSession(user.ID, hashSessionToken(cfg, token), expiresAt, c.Request.UserAgent(), c.ClientIP()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	_ = h.db.UpdateUserLastLogin(user.ID, time.Now())
 
+	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(cookieName(cfg), token, int(sessionTTL.Seconds()), "/", "", cfg.Auth.CookieSecure, true)
 	principal := Principal{
 		Authenticated: true,
@@ -119,15 +120,24 @@ func (h *Handler) LoginSession(c *gin.Context) {
 		Role:          db.NormalizeUserRole(user.Role),
 		Source:        "session",
 	}
+	h.audit(c, "login", "session", &user.ID, "Created session", map[string]any{
+		"username": user.Username,
+	})
 	c.JSON(http.StatusOK, principalToResponse(principal, cfg))
 }
 
 func (h *Handler) LogoutSession(c *gin.Context) {
 	cfg := h.cfg.Snapshot()
+	principal := GetPrincipal(c)
 	if rawToken, err := c.Cookie(cookieName(cfg)); err == nil && strings.TrimSpace(rawToken) != "" {
-		_ = h.db.DeleteSession(hashSessionToken(rawToken))
+		_ = h.db.DeleteSession(hashSessionToken(cfg, rawToken))
 	}
 	clearSessionCookie(c, cfg)
+	if principal.Authenticated {
+		h.audit(c, "logout", "session", &principal.UserID, "Deleted session", map[string]any{
+			"username": principal.Username,
+		})
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -176,6 +186,11 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.audit(c, "create", "user", &user.ID, "Created user", map[string]any{
+		"username": user.Username,
+		"role":     user.Role,
+		"enabled":  user.Enabled,
+	})
 	c.JSON(http.StatusCreated, user)
 }
 
@@ -246,6 +261,13 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 	}
 
 	user, _ := h.db.GetUserByID(id)
+	if user != nil {
+		h.audit(c, "update", "user", &user.ID, "Updated user", map[string]any{
+			"username": user.Username,
+			"role":     user.Role,
+			"enabled":  user.Enabled,
+		})
+	}
 	c.JSON(http.StatusOK, user)
 }
 
@@ -283,6 +305,10 @@ func (h *Handler) DeleteUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.audit(c, "delete", "user", &id, "Deleted user", map[string]any{
+		"username": current.Username,
+		"role":     current.Role,
+	})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

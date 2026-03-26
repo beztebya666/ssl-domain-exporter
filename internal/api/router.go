@@ -1,10 +1,12 @@
 package api
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -23,33 +25,37 @@ func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched 
 
 	r := gin.Default()
 
+	loginLimiter := NewRateLimiter()
+	adminLimiter := NewRateLimiter()
+
+	r.Use(RequestIDMiddleware())
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
+		AllowOriginFunc:  corsOriginAllowed(cfg),
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-API-Key"},
-		ExposeHeaders:    []string{"Content-Length"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-API-Key", csrfHeaderName, requestIDHeaderName},
+		ExposeHeaders:    []string{"Content-Length", requestIDHeaderName},
 		AllowCredentials: true,
 	}))
 
 	r.Use(AuthMiddleware(cfg, database))
+	r.Use(CSRFMiddleware(cfg))
 
 	h := NewHandler(cfg, database, chk, sched, m)
 	distDir := resolveFrontendDistDir()
-	log.Printf("UI dist directory: %s", distDir)
+	slog.Info("Resolved UI dist directory", "path", distDir)
 
 	if cfg.Prometheus.Enabled {
 		r.GET(cfg.Prometheus.Path, gin.WrapH(promhttp.Handler()))
 	}
 
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
+	r.GET("/health", h.Health)
+	r.GET("/ready", h.Readiness)
 
 	api := r.Group("/api")
 	{
 		api.GET("/bootstrap", h.GetBootstrap)
 		api.GET("/me", h.GetMe)
-		api.POST("/session/login", h.LoginSession)
+		api.POST("/session/login", LoginRateLimitMiddleware(cfg, loginLimiter), h.LoginSession)
 		api.POST("/session/logout", h.LogoutSession)
 	}
 
@@ -85,9 +91,14 @@ func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched 
 
 	admin := api.Group("/")
 	admin.Use(RequireAdmin(cfg))
+	admin.Use(AdminWriteRateLimitMiddleware(cfg, adminLimiter))
 	{
 		admin.GET("/config", h.GetConfig)
 		admin.PUT("/config", h.UpdateConfig)
+		admin.GET("/audit-logs", h.GetAuditLogs)
+		admin.GET("/maintenance/backups", h.ListBackups)
+		admin.POST("/maintenance/backup", h.CreateBackup)
+		admin.POST("/maintenance/prune", h.PruneChecks)
 		admin.POST("/custom-fields", h.CreateCustomField)
 		admin.PUT("/custom-fields/:id", h.UpdateCustomField)
 		admin.DELETE("/custom-fields/:id", h.DeleteCustomField)
@@ -135,4 +146,48 @@ func resolveFrontendDistDir() string {
 	}
 
 	return filepath.Clean("./frontend/dist")
+}
+
+func corsOriginAllowed(cfg *config.Config) func(string) bool {
+	return func(origin string) bool {
+		normalized, ok := normalizeAllowedOrigin(origin)
+		if !ok {
+			return false
+		}
+		snap := cfg.Snapshot()
+		for _, candidate := range snap.Server.AllowedOrigins {
+			if allowed, valid := normalizeAllowedOrigin(candidate); valid && allowed == normalized {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func normalizeAllowedOrigin(origin string) (string, bool) {
+	value := strings.TrimSpace(origin)
+	if value == "" || value == "null" {
+		return "", false
+	}
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil {
+		return "", false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	if parsed.Host == "" {
+		return "", false
+	}
+	if parsed.User != nil {
+		return "", false
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", false
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	return scheme + "://" + strings.ToLower(parsed.Host), true
 }

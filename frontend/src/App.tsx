@@ -181,22 +181,31 @@ function SidebarContent({
 }) {
   const roleBadge = useMemo(() => {
     if (!me?.authenticated) {
-      return publicUI ? 'Public read-only' : 'Guest'
+      return publicUI ? 'Public Read-Only' : 'Guest'
     }
-    return `${me.role} access`
+    switch (me.role) {
+      case 'admin':
+        return 'Admin Access'
+      case 'editor':
+        return 'Editor Access'
+      case 'viewer':
+        return 'Viewer Access'
+      default:
+        return 'Authenticated'
+    }
   }, [me?.authenticated, me?.role, publicUI])
 
   return (
     <>
       <div className="border-b border-slate-700/60 p-4">
         <div className={`flex items-start ${collapsed ? 'justify-center' : 'justify-between gap-3'}`}>
-          <NavLink to="/" onClick={onNavigate} className={`group flex items-center ${collapsed ? 'justify-center' : 'gap-2.5'}`} title={collapsed ? 'SSL Domain Exporter' : undefined}>
+          <NavLink to="/" onClick={onNavigate} className={`group flex items-center no-underline ${collapsed ? 'justify-center' : 'gap-2.5'}`} title={collapsed ? 'SSL Domain Exporter' : undefined}>
           <div className="flex-shrink-0 rounded-lg bg-blue-500/15 p-1.5">
             <Activity size={18} className="text-blue-400" />
           </div>
           {!collapsed && (
             <div className="min-w-0">
-            <div className="text-sm font-bold leading-tight text-white transition-colors group-hover:text-blue-400">SSL Domain Exporter</div>
+            <div className="text-sm font-bold leading-tight text-white">SSL Domain Exporter</div>
             <div className="mt-0.5 text-[10px] leading-tight text-slate-500">Certificate, Domain & Validation Checks</div>
             </div>
           )}
@@ -217,7 +226,7 @@ function SidebarContent({
           <div className="mt-2.5 flex flex-wrap gap-1.5 text-[11px]">
           <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-0.5 text-slate-300">{roleBadge}</span>
           {me?.can_edit && (
-            <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-emerald-300">Editor</span>
+            <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-emerald-300">Can Edit</span>
           )}
           </div>
         )}

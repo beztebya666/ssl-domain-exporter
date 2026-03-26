@@ -237,6 +237,11 @@ go run ./cmd/server
 
 After that, the UI is available at `http://localhost:8080`.
 
+HTTPS note for `v1.3.0`:
+
+- The application itself currently serves HTTP only.
+- If you need `https://`, place it behind a reverse proxy such as Nginx, Caddy, Traefik, or a Kubernetes ingress and terminate TLS there.
+
 ## Docker
 
 Build image:
@@ -251,7 +256,36 @@ Run:
 docker run --name ssl-domain-exporter \
   -p 8080:8080 \
   -v ./data:/app/data \
+  ssl-domain-exporter
+```
+
+Container defaults:
+
+- The image sets `CONFIG_DIR=/app/data`
+- Runtime config is stored at `/app/data/config.yaml`
+- SQLite data is stored at `/app/data/checker.db`
+- Backup files default to `/app/data/backups`
+- The container runs as an unprivileged user (`uid=10001`), so the mounted data directory must be writable by that user
+- For `v1.3.0`, the containerized app still listens on plain HTTP inside the container. If you need external HTTPS, terminate TLS in a reverse proxy/load balancer in front of it.
+
+To pre-seed configuration, place your file at `./data/config.yaml` before first start:
+
+```bash
+docker run --name ssl-domain-exporter \
+  -p 8080:8080 \
+  -v ./data:/app/data \
+  -v ./config.yaml:/app/data/config.yaml \
+  ssl-domain-exporter
+```
+
+If you prefer to keep the config outside `/app/data`, mount it separately and set `CONFIG_PATH` explicitly:
+
+```bash
+docker run --name ssl-domain-exporter \
+  -p 8080:8080 \
+  -v ./data:/app/data \
   -v ./config.yaml:/app/config.yaml \
+  -e CONFIG_PATH=/app/config.yaml \
   ssl-domain-exporter
 ```
 
@@ -259,23 +293,8 @@ Health check:
 
 ```bash
 curl http://localhost:8080/health
+curl http://localhost:8080/ready
 ```
-
-## Release Verification
-
-Before cutting a release, run the automated release checks:
-
-```bash
-make release-check
-```
-
-Then complete the short manual checklist in [docs/release-checklist.md](docs/release-checklist.md), especially for:
-
-- dark/light theme verification
-- responsive/mobile navigation
-- `ssl_only` and `full` workflows
-- notification channel tests
-- filtered export and pagination flows
 
 ## Configuration
 
@@ -285,6 +304,7 @@ Defaults:
 
 - If `config.yaml` is missing, the app creates it with default values.
 - Default DB path: `./data/checker.db`.
+- In the container image, default runtime paths come from `CONFIG_DIR=/app/data`, so both config and DB live under `/app/data`.
 
 Ways to set config path:
 
@@ -292,12 +312,29 @@ Ways to set config path:
 - ENV `CONFIG_PATH`
 - Flag `-config-dir <dir>` or ENV `CONFIG_DIR` (config path becomes `<dir>/config.yaml`)
 
+SQLite operational helpers:
+
+- `go run ./cmd/server -backup ./data/backups/manual-backup.db`
+- `go run ./cmd/server -restore ./data/backups/manual-backup.db`
+
+Production secret strategy:
+
+- Plain config values still work for simple/local deployments.
+- For containers and production, prefer mounted secret files via `*_FILE` env overrides instead of storing credentials directly in `config.yaml`.
+- Supported file-backed secret envs:
+  - `AUTH_PASSWORD_FILE`
+  - `AUTH_API_KEY_FILE`
+  - `WEBHOOK_URL_FILE`
+  - `TELEGRAM_BOT_TOKEN_FILE`
+  - `EMAIL_PASSWORD_FILE`
+
 Safe-start example:
 
 ```yaml
 server:
   host: "0.0.0.0"
   port: "8080"
+  allowed_origins: []      # optional CORS allowlist for split UI/API deployments
 
 database:
   path: "./data/checker.db"
@@ -323,6 +360,20 @@ auth:
   session_ttl: "24h"
   cookie_name: "ssl_domain_exporter_session"
   cookie_secure: false
+
+security:
+  csrf_enabled: true
+  rate_limit_enabled: true
+  login_requests: 10
+  login_window: "5m"
+  admin_write_requests: 300
+  admin_window: "1m"
+
+maintenance:
+  backups_dir: "./data/backups"
+  check_retention_days: 0          # 0 = keep history forever
+  audit_retention_days: 0          # 0 = keep audit log forever
+  retention_sweep_interval: "24h"
 
 status_policy:
   badge_on_invalid_chain: true
@@ -353,6 +404,10 @@ notifications:
 prometheus:
   enabled: true
   path: "/metrics"
+  labels:
+    export_tags: true
+    export_metadata: true
+    metadata_keys: []              # empty = export all metadata keys
 ```
 
 `status_policy` can also be tuned quickly from the UI with presets:
@@ -387,7 +442,12 @@ Ways to provide API key:
 
 - Header `X-API-Key: <key>`
 - Header `Authorization: Bearer <key>`
-- Query `?api_key=<key>`
+
+Cross-origin browser access:
+
+- Built-in UI and same-origin browser requests work without extra CORS config
+- For split UI/API deployments, set `server.allowed_origins` to an explicit list of UI origins (for example `https://ui.example.com`)
+- Credentialed cross-origin requests are rejected unless the origin is on that allowlist
 
 UI behavior:
 
@@ -397,11 +457,26 @@ UI behavior:
 
 Important: browser login uses local sessions and accepts either a local UI user or the legacy admin username/password from `config.yaml`. API key mode is still available for automation and can be combined with browser login by using `mode: both`.
 
+Session-authenticated browser writes now include:
+
+- CSRF protection for `POST` / `PUT` / `DELETE`
+- soft rate limiting for login and admin write endpoints
+- request IDs in the `X-Request-ID` response header
+- audit log entries for config, user, domain, folder, custom-field, backup, prune, and session actions
+
+Secret editing in the UI:
+
+- Saved secrets are masked in Settings and are not returned in plaintext by `/api/config`
+- Leaving a masked secret field untouched keeps the current value
+- Typing a new value replaces it
+- Clicking `Clear` removes the saved value
+
 ## REST API (Main Endpoints)
 
 ### Service
 
 - `GET /health`
+- `GET /ready`
 - `GET /metrics` (if enabled)
 
 ### Access / UI Bootstrap
@@ -411,10 +486,18 @@ Important: browser login uses local sessions and accepts either a local UI user 
 - `POST /api/session/login`
 - `POST /api/session/logout`
 
+If you use cookie-based browser sessions outside the built-in UI, send `X-CSRF-Token` with the value from the `*_csrf` cookie on mutating requests.
+
 ### Config
 
 - `GET /api/config`
 - `PUT /api/config`
+- `GET /api/notifications/status`
+- `POST /api/notifications/test` - tests the selected channel; the Settings UI sends the current unsaved notification form values
+- `GET /api/audit-logs`
+- `GET /api/maintenance/backups`
+- `POST /api/maintenance/backup`
+- `POST /api/maintenance/prune`
 - `GET /api/settings` (compat)
 - `PUT /api/settings` (compat)
 - `GET /api/users`
@@ -463,7 +546,7 @@ Important: browser login uses local sessions and accepts either a local UI user 
 Create domain with ssl_only mode and custom DNS:
 
 ```bash
-curl -X POST -u admin:admin \
+curl -X POST -u admin:<your-password> \
   -H "Content-Type: application/json" \
   -d '{"name":"internal.local","check_mode":"ssl_only","dns_servers":"10.0.0.1:53"}' \
   http://localhost:8080/api/domains
@@ -472,7 +555,7 @@ curl -X POST -u admin:admin \
 Create domain with a custom root CA:
 
 ```bash
-curl -X POST -u admin:admin \
+curl -X POST -u admin:<your-password> \
   -H "Content-Type: application/json" \
   -d @- http://localhost:8080/api/domains <<'JSON'
 {
@@ -485,7 +568,7 @@ JSON
 Create domain with multiple tags and metadata:
 
 ```bash
-curl -X POST -u admin:admin \
+curl -X POST -u admin:<your-password> \
   -H "Content-Type: application/json" \
   -d @- http://localhost:8080/api/domains <<'JSON'
 {
@@ -503,7 +586,7 @@ JSON
 Batch import with upsert and metadata:
 
 ```bash
-curl -X POST -u admin:admin \
+curl -X POST -u admin:<your-password> \
   -H "Content-Type: application/json" \
   -d @- http://localhost:8080/api/domains/import <<'JSON'
 {
@@ -539,7 +622,7 @@ JSON
 Run domain check:
 
 ```bash
-curl -X POST -u admin:admin http://localhost:8080/api/domains/1/check
+curl -X POST -u admin:<your-password> http://localhost:8080/api/domains/1/check
 ```
 
 ## Feature Flags
@@ -599,6 +682,7 @@ Metrics are exposed at `prometheus.path` (default: `/metrics`).
 - `domain_tag_info` is the recommended metric for Grafana filtering or Prometheus joins by tag
 - `domain_metadata_info` exposes structured metadata for Prometheus/Grafana joins without changing the label set of the core operational metrics
 - `domain_expiry_days` may be negative for already expired registrations, which is expected and indicates how many days ago expiry happened
+- By default, tag and metadata info metrics stay fully permissive. If Prometheus cardinality becomes a concern, use `prometheus.labels.export_tags`, `prometheus.labels.export_metadata`, or `prometheus.labels.metadata_keys` to narrow export without removing metadata from the product itself.
 
 Example PromQL:
 
@@ -625,15 +709,20 @@ Ready-to-use files:
 Overrides are supported for most settings, for example:
 
 - `SERVER_HOST`, `SERVER_PORT`, `DATABASE_PATH`
+- `SERVER_ALLOWED_ORIGINS` (comma-separated, e.g. `https://ui.example.com,https://ops.example.com`)
 - `AUTH_*` (`AUTH_ENABLED`, `AUTH_MODE`, `AUTH_USERNAME`, `AUTH_PASSWORD`, `AUTH_API_KEY`, ...)
 - `FEATURE_*` (`FEATURE_HTTP_CHECK`, `FEATURE_OCSP_CHECK`, ...)
 - `PROMETHEUS_ENABLED`, `PROMETHEUS_PATH`
+- `PROMETHEUS_EXPORT_TAGS`, `PROMETHEUS_EXPORT_METADATA`, `PROMETHEUS_METADATA_KEYS`
 - `WEBHOOK_*`, `TELEGRAM_*`
+- `SECURITY_*` (`SECURITY_CSRF_ENABLED`, `SECURITY_LOGIN_REQUESTS`, ...)
+- `MAINTENANCE_*` (`MAINTENANCE_BACKUPS_DIR`, `MAINTENANCE_CHECK_RETENTION_DAYS`, `MAINTENANCE_AUDIT_RETENTION_DAYS`, ...)
 - `LOG_JSON`
 - `DNS_SERVERS` (comma-separated, e.g. `10.0.0.1:53,10.0.0.2:53`)
 - `DNS_USE_SYSTEM_DNS` (`true`/`false`)
 - `DNS_TIMEOUT` (e.g. `5s`)
 - `DEFAULT_CHECK_MODE` (`full` or `ssl_only`)
+- Secret file envs: `AUTH_PASSWORD_FILE`, `AUTH_API_KEY_FILE`, `WEBHOOK_URL_FILE`, `TELEGRAM_BOT_TOKEN_FILE`, `EMAIL_PASSWORD_FILE`
 
 Full list: `internal/config/config.go` (`applyEnvOverrides`).
 
@@ -663,7 +752,7 @@ data                  # SQLite DB (runtime)
 
 ## Notes
 
-- Scheduler polls every minute and runs checks according to `domain.check_interval`.
+- Scheduler wakes on the nearest due domain check or maintenance deadline instead of polling on a fixed one-minute loop.
 - Per-domain `check_interval` controls scheduling cadence, while `checker.retry_count` controls immediate retry attempts for transient check failures inside a single run.
 - With auth enabled, `/api` protection is on by default (`protect_api: true`).
 - Runtime config access is thread-safe: reads go through `Snapshot()`, runtime updates apply via `ApplyFrom()`, and `Save()` writes a normalized snapshot to disk.

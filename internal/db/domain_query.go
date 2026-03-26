@@ -1,9 +1,8 @@
 package db
 
 import (
-	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 )
@@ -87,6 +86,7 @@ func (d *DB) GetDomainsByIDs(ids []int64) ([]Domain, error) {
 		args = append(args, id)
 	}
 
+	//nolint:gosec // Placeholder list is derived from ID count only; selected columns are static constants.
 	rows, err := d.sql.Query(`SELECT `+domainSelectCols+` FROM domains WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return nil, err
@@ -124,16 +124,17 @@ func (d *DB) GetLastChecksByDomainIDs(ids []int64) (map[int64]*Check, error) {
 		args = append(args, id)
 	}
 
+	//nolint:gosec // Placeholder list is derived from ID count only; selected columns are static constants.
 	rows, err := d.sql.Query(`
-		WITH latest AS (
-			SELECT domain_id, MAX(checked_at) AS max_at
+		WITH ranked AS (
+			SELECT `+checkSelectCols+`,
+				ROW_NUMBER() OVER (PARTITION BY domain_id ORDER BY checked_at DESC, id DESC) AS rn
 			FROM domain_checks
 			WHERE domain_id IN (`+strings.Join(placeholders, ",")+`)
-			GROUP BY domain_id
 		)
-		SELECT `+prefixCols("dc.", checkSelectCols)+`
-		FROM domain_checks dc
-		INNER JOIN latest ON latest.domain_id = dc.domain_id AND latest.max_at = dc.checked_at
+		SELECT `+prefixCols("ranked.", checkSelectCols)+`
+		FROM ranked
+		WHERE ranked.rn = 1
 	`, args...)
 	if err != nil {
 		return nil, err
@@ -185,6 +186,7 @@ func (d *DB) searchDomainIDs(query DomainListQuery) ([]int64, int, error) {
 	}
 
 	orderSQL := buildDomainListOrder(query)
+	//nolint:gosec // WHERE/ORDER fragments are produced by internal builders that keep user values parameterized.
 	querySQL := cte + `
 		SELECT d.id
 		FROM domains d
@@ -228,7 +230,7 @@ func buildDomainListWhere(query DomainListQuery) (string, []any) {
 
 	if search := strings.ToLower(strings.TrimSpace(query.Search)); search != "" {
 		pattern := "%" + search + "%"
-		clauses = append(clauses, `(lower(d.name) LIKE ? OR lower(coalesce(d.tags, '')) LIKE ? OR lower(coalesce(d.metadata_json, '')) LIKE ?)`)
+		clauses = append(clauses, `(lower(d.name) LIKE ? OR EXISTS (SELECT 1 FROM json_each(coalesce(d.tags_json, '[]')) AS tag WHERE lower(tag.value) LIKE ?) OR lower(coalesce(d.metadata_json, '')) LIKE ?)`)
 		args = append(args, pattern, pattern, pattern)
 	}
 
@@ -242,8 +244,8 @@ func buildDomainListWhere(query DomainListQuery) (string, []any) {
 	}
 
 	if tag := strings.ToLower(strings.TrimSpace(query.Tag)); tag != "" && tag != "all" {
-		clauses = append(clauses, `(',' || replace(lower(coalesce(d.tags, '')), ' ', '') || ',') LIKE ?`)
-		args = append(args, "%,"+strings.ReplaceAll(tag, " ", "")+",%")
+		clauses = append(clauses, `EXISTS (SELECT 1 FROM json_each(coalesce(d.tags_json, '[]')) AS tag WHERE lower(trim(tag.value)) = ?)`)
+		args = append(args, tag)
 	}
 
 	if query.FolderID != nil {
@@ -325,15 +327,12 @@ func buildDomainListOrder(query DomainListQuery) string {
 	}
 }
 
-func nullInt64(value *int) sql.NullInt64 {
-	if value == nil {
-		return sql.NullInt64{}
-	}
-	return sql.NullInt64{Int64: int64(*value), Valid: true}
-}
-
 func (d *DB) ListTags() ([]string, error) {
-	rows, err := d.sql.Query(`SELECT tags FROM domains WHERE trim(coalesce(tags, '')) <> ''`)
+	rows, err := d.sql.Query(`
+		SELECT tag.value
+		FROM domains d, json_each(coalesce(d.tags_json, '[]')) AS tag
+		WHERE trim(coalesce(tag.value, '')) <> ''
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +344,7 @@ func (d *DB) ListTags() ([]string, error) {
 		if err := rows.Scan(&raw); err != nil {
 			return nil, err
 		}
-		for _, tag := range ParseLegacyTags(raw) {
+		for _, tag := range NormalizeTags([]string{raw}) {
 			if tag == "" {
 				continue
 			}
@@ -370,6 +369,6 @@ func sortStrings(values []string) {
 	}
 	sort.Slice(values, func(i, j int) bool { return strings.ToLower(values[i]) < strings.ToLower(values[j]) })
 	if len(values) > 5000 {
-		log.Printf("[db] unusually high tag cardinality detected: %d distinct tags", len(values))
+		slog.Warn("Unusually high tag cardinality detected", "distinct_tags", len(values))
 	}
 }

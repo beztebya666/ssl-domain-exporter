@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +14,8 @@ import (
 )
 
 type DB struct {
-	sql *sql.DB
+	sql  *sql.DB
+	path string
 }
 
 type Domain struct {
@@ -194,7 +195,7 @@ func New(path string) (*DB, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	sqldb.SetMaxOpenConns(1)
-	return &DB{sql: sqldb}, nil
+	return &DB{sql: sqldb, path: path}, nil
 }
 
 func (d *DB) Close() error {
@@ -336,12 +337,31 @@ func (d *DB) Migrate() error {
 			UNIQUE(field_id, value)
 		);
 
+		CREATE TABLE IF NOT EXISTS audit_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			actor_username TEXT NOT NULL DEFAULT '',
+			actor_role TEXT NOT NULL DEFAULT '',
+			actor_source TEXT NOT NULL DEFAULT '',
+			action TEXT NOT NULL,
+			resource TEXT NOT NULL,
+			resource_id INTEGER,
+			summary TEXT NOT NULL DEFAULT '',
+			details_json TEXT NOT NULL DEFAULT '{}',
+			remote_addr TEXT NOT NULL DEFAULT '',
+			request_id TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+
 		CREATE INDEX IF NOT EXISTS idx_checks_domain_id ON domain_checks(domain_id);
 		CREATE INDEX IF NOT EXISTS idx_checks_checked_at ON domain_checks(checked_at);
+		CREATE INDEX IF NOT EXISTS idx_checks_domain_checked_at ON domain_checks(domain_id, checked_at DESC, id DESC);
 		CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
 		CREATE INDEX IF NOT EXISTS idx_user_sessions_expires_at ON user_sessions(expires_at);
 		CREATE INDEX IF NOT EXISTS idx_custom_fields_sort_order ON custom_fields(sort_order);
 		CREATE INDEX IF NOT EXISTS idx_custom_field_options_field_id ON custom_field_options(field_id);
+		CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC, id DESC);
+		CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource, resource_id, created_at DESC);
 	`)
 	if err != nil {
 		return err
@@ -373,6 +393,15 @@ func (d *DB) Migrate() error {
 	}
 
 	if err := d.addColumnIfMissing("folders", "sort_order", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.addDateTimeColumnIfMissing("folders", "created_at"); err != nil {
+		return err
+	}
+	if err := d.addDateTimeColumnIfMissing("folders", "updated_at"); err != nil {
+		return err
+	}
+	if err := d.backfillFolderTimestamps(); err != nil {
 		return err
 	}
 
@@ -410,6 +439,9 @@ func (d *DB) Migrate() error {
 	}
 
 	if err := d.backfillDomainSortOrder(); err != nil {
+		return err
+	}
+	if err := d.backfillDomainTagsJSON(); err != nil {
 		return err
 	}
 	if err := d.backfillFolderSortOrder(); err != nil {
@@ -552,6 +584,80 @@ func (d *DB) GetDomainsForScheduling() ([]Domain, error) {
 	return scanDomainRows(rows)
 }
 
+func (d *DB) GetNextScheduledCheckAt(now time.Time) (*time.Time, error) {
+	rows, err := d.sql.Query(`
+		WITH latest AS (
+			SELECT domain_id, MAX(checked_at) AS last_checked_at
+			FROM domain_checks
+			GROUP BY domain_id
+		)
+		SELECT d.check_interval, latest.last_checked_at
+		FROM domains d
+		LEFT JOIN latest ON latest.domain_id = d.id
+		WHERE d.enabled = 1
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var earliest *time.Time
+	for rows.Next() {
+		var interval int
+		var lastChecked sql.NullString
+		if err := rows.Scan(&interval, &lastChecked); err != nil {
+			return nil, err
+		}
+		candidate := now.UTC()
+		if lastChecked.Valid {
+			parsed, err := parseDBTime(lastChecked.String)
+			if err != nil {
+				return nil, fmt.Errorf("parse last scheduled check time: %w", err)
+			}
+			candidate = parsed.Add(time.Duration(interval) * time.Second)
+		}
+		if earliest == nil || candidate.Before(*earliest) {
+			next := candidate
+			earliest = &next
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return earliest, nil
+}
+
+func parseDBTime(raw string) (time.Time, error) {
+	value := normalizeDBTimeString(raw)
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		"2006-01-02 15:04:05 -0700 MST",
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	}
+	var lastErr error
+	for _, format := range formats {
+		parsed, err := time.Parse(format, value)
+		if err == nil {
+			return parsed.UTC(), nil
+		}
+		lastErr = err
+	}
+	return time.Time{}, fmt.Errorf("unsupported time format %q: %w", value, lastErr)
+}
+
+func normalizeDBTimeString(raw string) string {
+	value := strings.TrimSpace(raw)
+	if idx := strings.Index(value, " m=+"); idx >= 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	return value
+}
+
 // ---- Check CRUD ----
 
 const checkInsertCols = `domain_id, checked_at,
@@ -592,11 +698,11 @@ func (d *DB) SaveCheck(c *Check) error {
 		return fmt.Errorf("marshal status reasons json: %w", err)
 	}
 	args := []any{
-		c.DomainID, c.CheckedAt,
-		c.DomainStatus, c.DomainRegistrar, c.DomainCreatedAt, c.DomainExpiresAt,
+		c.DomainID, sanitizeDBTime(c.CheckedAt),
+		c.DomainStatus, c.DomainRegistrar, sanitizeDBTimePtr(c.DomainCreatedAt), sanitizeDBTimePtr(c.DomainExpiresAt),
 		c.DomainExpiryDays, c.DomainCheckError, c.DomainSource,
 		c.RegistrationCheckSkipped, c.RegistrationSkipReason, c.DNSServerUsed,
-		c.SSLIssuer, c.SSLSubject, c.SSLValidFrom, c.SSLValidUntil,
+		c.SSLIssuer, c.SSLSubject, sanitizeDBTimePtr(c.SSLValidFrom), sanitizeDBTimePtr(c.SSLValidUntil),
 		c.SSLExpiryDays, c.SSLVersion, c.SSLCheckError,
 		c.SSLChainValid, c.SSLChainLength, c.SSLChainError, string(chainJSON),
 		c.HTTPStatusCode, c.HTTPRedirectsHTTPS, c.HTTPHSTSEnabled, c.HTTPHSTSMaxAge, c.HTTPResponseTimeMs, c.HTTPFinalURL, c.HTTPError,
@@ -607,12 +713,13 @@ func (d *DB) SaveCheck(c *Check) error {
 		c.OverallStatus, c.CheckDuration,
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(args)), ",")
+	//nolint:gosec // Column and placeholder lists are derived from static constants; values remain parameterized.
 	_, err = d.sql.Exec(`INSERT INTO domain_checks (`+checkInsertCols+`) VALUES (`+placeholders+`)`, args...)
 	return err
 }
 
 func (d *DB) GetLastCheck(domainID int64) (*Check, error) {
-	return d.scanCheck(d.sql.QueryRow(`SELECT `+checkSelectCols+` FROM domain_checks WHERE domain_id = ? ORDER BY checked_at DESC LIMIT 1`, domainID))
+	return d.scanCheck(d.sql.QueryRow(`SELECT `+checkSelectCols+` FROM domain_checks WHERE domain_id = ? ORDER BY checked_at DESC, id DESC LIMIT 1`, domainID))
 }
 
 func (d *DB) GetCheckHistory(domainID int64, limit int) ([]Check, error) {
@@ -629,18 +736,10 @@ func (d *DB) GetCheckHistoryPage(domainID int64, limit, offset int) ([]Check, er
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := d.sql.Query(`SELECT `+checkSelectCols+` FROM domain_checks WHERE domain_id = ? ORDER BY checked_at DESC LIMIT ?`,
-		domainID, limit)
+	rows, err := d.sql.Query(`SELECT `+checkSelectCols+` FROM domain_checks WHERE domain_id = ? ORDER BY checked_at DESC, id DESC LIMIT ? OFFSET ?`,
+		domainID, limit, offset)
 	if err != nil {
 		return nil, err
-	}
-	if offset > 0 {
-		rows.Close()
-		rows, err = d.sql.Query(`SELECT `+checkSelectCols+` FROM domain_checks WHERE domain_id = ? ORDER BY checked_at DESC LIMIT ? OFFSET ?`,
-			domainID, limit, offset)
-		if err != nil {
-			return nil, err
-		}
 	}
 	defer rows.Close()
 
@@ -662,12 +761,16 @@ func (d *DB) CountCheckHistory(domainID int64) (int, error) {
 }
 
 func (d *DB) GetAllLastChecks() (map[int64]*Check, error) {
+	//nolint:gosec // Query shape is built from static column lists to keep scan order in sync.
 	rows, err := d.sql.Query(`
-		SELECT ` + prefixCols("dc.", checkSelectCols) + `
-		FROM domain_checks dc
-		INNER JOIN (
-			SELECT domain_id, MAX(checked_at) as max_at FROM domain_checks GROUP BY domain_id
-		) latest ON dc.domain_id = latest.domain_id AND dc.checked_at = latest.max_at`)
+		WITH ranked AS (
+			SELECT ` + checkSelectCols + `,
+				ROW_NUMBER() OVER (PARTITION BY domain_id ORDER BY checked_at DESC, id DESC) AS rn
+			FROM domain_checks
+		)
+		SELECT ` + prefixCols("ranked.", checkSelectCols) + `
+		FROM ranked
+		WHERE ranked.rn = 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -724,17 +827,19 @@ func (d *DB) GetFolders() ([]Folder, error) {
 		SELECT
 			f.id,
 			f.name,
-			COUNT(d.id) AS domain_count,
+			(
+				SELECT COUNT(*)
+				FROM domains d
+				WHERE d.folder_id = f.id
+			) AS domain_count,
 			f.sort_order,
 			f.created_at,
 			f.updated_at
 		FROM folders f
-		LEFT JOIN domains d ON d.folder_id = f.id
-		GROUP BY f.id, f.name, f.sort_order, f.created_at, f.updated_at
-		ORDER BY sort_order ASC, name ASC
+		ORDER BY f.sort_order ASC, f.name ASC
 	`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query folders: %w", err)
 	}
 	defer rows.Close()
 
@@ -742,7 +847,7 @@ func (d *DB) GetFolders() ([]Folder, error) {
 	for rows.Next() {
 		var f Folder
 		if err := rows.Scan(&f.ID, &f.Name, &f.DomainCount, &f.SortOrder, &f.CreatedAt, &f.UpdatedAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan folder row: %w", err)
 		}
 		folders = append(folders, f)
 	}
@@ -755,7 +860,7 @@ func (d *DB) CreateFolder(name string) (*Folder, error) {
 		return nil, err
 	}
 	res, err := d.sql.Exec(`
-		INSERT INTO folders (name, sort_order) VALUES (?, ?)
+		INSERT INTO folders (name, sort_order, created_at, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 	`, name, sortOrder)
 	if err != nil {
 		return nil, err
@@ -770,20 +875,22 @@ func (d *DB) GetFolderByID(id int64) (*Folder, error) {
 		SELECT
 			f.id,
 			f.name,
-			COUNT(d.id) AS domain_count,
+			(
+				SELECT COUNT(*)
+				FROM domains d
+				WHERE d.folder_id = f.id
+			) AS domain_count,
 			f.sort_order,
 			f.created_at,
 			f.updated_at
 		FROM folders f
-		LEFT JOIN domains d ON d.folder_id = f.id
 		WHERE f.id = ?
-		GROUP BY f.id, f.name, f.sort_order, f.created_at, f.updated_at
 	`, id).Scan(&f.ID, &f.Name, &f.DomainCount, &f.SortOrder, &f.CreatedAt, &f.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get folder by id %d: %w", id, err)
 	}
 	return &f, nil
 }
@@ -800,7 +907,7 @@ func (d *DB) DeleteFolder(id int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	if _, err := tx.Exec(`UPDATE domains SET folder_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE folder_id=?`, id); err != nil {
 		return err
@@ -816,7 +923,7 @@ func (d *DB) ReorderDomains(ids []int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	for i, id := range ids {
 		if _, err := tx.Exec(`UPDATE domains SET sort_order=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, i+1, id); err != nil {
@@ -853,7 +960,7 @@ func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, fol
 	}
 	if strings.TrimSpace(tagsJSON) != "" {
 		if err := json.Unmarshal([]byte(tagsJSON), &dom.Tags); err != nil {
-			log.Printf("db: failed to parse tags_json for domain %q: %v", dom.Name, err)
+			slog.Warn("DB failed to parse tags_json", "domain", dom.Name, "error", err)
 		}
 	}
 	if len(dom.Tags) == 0 {
@@ -865,7 +972,7 @@ func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, fol
 	}
 	if strings.TrimSpace(metadataJSON) != "" {
 		if err := json.Unmarshal([]byte(metadataJSON), &dom.Metadata); err != nil {
-			log.Printf("db: failed to parse metadata_json for domain %q: %v", dom.Name, err)
+			slog.Warn("DB failed to parse metadata_json", "domain", dom.Name, "error", err)
 		}
 	}
 	if dom.Metadata != nil {
@@ -909,10 +1016,10 @@ func (d *DB) scanCheck(row *sql.Row) (*Check, error) {
 	}
 	applyNullTimes(&c, domCreatedAt, domExpiresAt, sslValidFrom, sslValidUntil)
 	if err := json.Unmarshal([]byte(chainJSON), &c.SSLChainDetails); err != nil && strings.TrimSpace(chainJSON) != "" {
-		log.Printf("db: failed to parse ssl_chain_details for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+		slog.Warn("DB failed to parse ssl_chain_details", "domain_id", c.DomainID, "check_id", c.ID, "error", err)
 	}
 	if err := json.Unmarshal([]byte(reasonsJSON), &c.StatusReasons); err != nil && strings.TrimSpace(reasonsJSON) != "" {
-		log.Printf("db: failed to parse status_reasons_json for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+		slog.Warn("DB failed to parse status_reasons_json", "domain_id", c.DomainID, "check_id", c.ID, "error", err)
 	}
 	return &c, nil
 }
@@ -941,12 +1048,27 @@ func (d *DB) scanCheckRow(rows *sql.Rows) (*Check, error) {
 	}
 	applyNullTimes(&c, domCreatedAt, domExpiresAt, sslValidFrom, sslValidUntil)
 	if err := json.Unmarshal([]byte(chainJSON), &c.SSLChainDetails); err != nil && strings.TrimSpace(chainJSON) != "" {
-		log.Printf("db: failed to parse ssl_chain_details for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+		slog.Warn("DB failed to parse ssl_chain_details", "domain_id", c.DomainID, "check_id", c.ID, "error", err)
 	}
 	if err := json.Unmarshal([]byte(reasonsJSON), &c.StatusReasons); err != nil && strings.TrimSpace(reasonsJSON) != "" {
-		log.Printf("db: failed to parse status_reasons_json for domain_id=%d check_id=%d: %v", c.DomainID, c.ID, err)
+		slog.Warn("DB failed to parse status_reasons_json", "domain_id", c.DomainID, "check_id", c.ID, "error", err)
 	}
 	return &c, nil
+}
+
+func sanitizeDBTime(value time.Time) time.Time {
+	if value.IsZero() {
+		return value
+	}
+	return value.UTC().Round(0)
+}
+
+func sanitizeDBTimePtr(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	sanitized := sanitizeDBTime(*value)
+	return sanitized
 }
 
 func applyNullTimes(c *Check, domCreatedAt, domExpiresAt, sslValidFrom, sslValidUntil sql.NullTime) {
@@ -1015,10 +1137,65 @@ func (d *DB) backfillDomainSortOrder() error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	for i, id := range ids {
 		if _, err := tx.Exec(`UPDATE domains SET sort_order = ? WHERE id = ? AND (sort_order IS NULL OR sort_order <= 0)`, i+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (d *DB) backfillDomainTagsJSON() error {
+	rows, err := d.sql.Query(`SELECT id, tags, tags_json FROM domains`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type update struct {
+		id       int64
+		tagsJSON string
+	}
+	updates := make([]update, 0)
+	for rows.Next() {
+		var (
+			id       int64
+			rawTags  string
+			tagsJSON string
+		)
+		if err := rows.Scan(&id, &rawTags, &tagsJSON); err != nil {
+			return err
+		}
+		if strings.TrimSpace(rawTags) == "" {
+			continue
+		}
+		if strings.TrimSpace(tagsJSON) != "" && strings.TrimSpace(tagsJSON) != "[]" {
+			continue
+		}
+		normalized := NormalizeTags(ParseLegacyTags(rawTags))
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return fmt.Errorf("marshal backfilled tags_json: %w", err)
+		}
+		updates = append(updates, update{id: id, tagsJSON: string(encoded)})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer rollbackTx(tx)
+
+	for _, item := range updates {
+		if _, err := tx.Exec(`UPDATE domains SET tags_json = ? WHERE id = ?`, item.tagsJSON, item.id); err != nil {
 			return err
 		}
 	}
@@ -1051,7 +1228,7 @@ func (d *DB) backfillFolderSortOrder() error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	for i, id := range ids {
 		if _, err := tx.Exec(`UPDATE folders SET sort_order = ? WHERE id = ? AND (sort_order IS NULL OR sort_order <= 0)`, i+1, id); err != nil {
@@ -1087,7 +1264,7 @@ func (d *DB) backfillCustomFieldSortOrder() error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	for i, id := range ids {
 		if _, err := tx.Exec(`UPDATE custom_fields SET sort_order = ? WHERE id = ? AND (sort_order IS NULL OR sort_order <= 0)`, i+1, id); err != nil {
@@ -1109,6 +1286,43 @@ func (d *DB) addColumnIfMissing(table, column, def string) error {
 	_, err = d.sql.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, def))
 	if err != nil {
 		return fmt.Errorf("add column %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+func (d *DB) addDateTimeColumnIfMissing(table, column string) error {
+	exists, err := d.columnExists(table, column)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	if !isSafeSQLIdent(table) || !isSafeSQLIdent(column) {
+		return fmt.Errorf("unsafe table/column identifier")
+	}
+
+	if _, err := d.sql.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s DATETIME", table, column)); err != nil {
+		return fmt.Errorf("add datetime column %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+func (d *DB) backfillFolderTimestamps() error {
+	if _, err := d.sql.Exec(`
+		UPDATE folders
+		SET created_at = CURRENT_TIMESTAMP
+		WHERE created_at IS NULL OR TRIM(CAST(created_at AS TEXT)) = ''
+	`); err != nil {
+		return fmt.Errorf("backfill folders.created_at: %w", err)
+	}
+	if _, err := d.sql.Exec(`
+		UPDATE folders
+		SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+		WHERE updated_at IS NULL OR TRIM(CAST(updated_at AS TEXT)) = ''
+	`); err != nil {
+		return fmt.Errorf("backfill folders.updated_at: %w", err)
 	}
 	return nil
 }
@@ -1157,4 +1371,13 @@ func isSafeSQLIdent(s string) bool {
 		return false
 	}
 	return true
+}
+
+func rollbackTx(tx *sql.Tx) {
+	if tx == nil {
+		return
+	}
+	if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+		slog.Debug("DB rollback failed", "error", err)
+	}
 }

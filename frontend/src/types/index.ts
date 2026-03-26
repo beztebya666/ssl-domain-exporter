@@ -260,9 +260,11 @@ export interface Summary {
 }
 
 export interface AppConfig {
+  warnings?: string[]
   server: {
     host: string
     port: string
+    allowed_origins: string[]
   }
   database: {
     path: string
@@ -350,6 +352,14 @@ export interface AppConfig {
     use_system_dns: boolean
     timeout: string
   }
+  security: {
+    csrf_enabled: boolean
+    rate_limit_enabled: boolean
+    login_requests: number
+    login_window: string
+    admin_write_requests: number
+    admin_window: string
+  }
   domains: {
     subdomain_fallback: boolean
     fallback_depth: number
@@ -358,6 +368,17 @@ export interface AppConfig {
   prometheus: {
     enabled: boolean
     path: string
+    labels: {
+      export_tags: boolean
+      export_metadata: boolean
+      metadata_keys: string[]
+    }
+  }
+  maintenance: {
+    backups_dir: string
+    check_retention_days: number
+    audit_retention_days: number
+    retention_sweep_interval: string
   }
   logging: {
     json: boolean
@@ -402,11 +423,19 @@ export interface NotificationDeliveryStatus {
   last_error?: string
 }
 
+export type NotificationChannel = 'webhook' | 'telegram' | 'email'
+
 export interface NotificationTestResult {
-  channel: 'webhook' | 'telegram' | 'email'
+  channel: NotificationChannel
   enabled: boolean
   success: boolean
   error?: string
+}
+
+export interface NotificationTestRequest {
+  channel?: NotificationChannel
+  features?: Pick<AppConfig['features'], 'notifications'>
+  notifications?: AppConfig['notifications']
 }
 
 export interface UserAccount {
@@ -424,4 +453,40 @@ export interface UserWritePayload {
   role: 'viewer' | 'editor' | 'admin'
   enabled?: boolean
   password?: string
+}
+
+export interface AuditLog {
+  id: number
+  actor_user_id?: number | null
+  actor_username: string
+  actor_role: string
+  actor_source: string
+  action: string
+  resource: string
+  resource_id?: number | null
+  summary: string
+  details?: Record<string, unknown>
+  remote_addr: string
+  request_id: string
+  created_at: string
+}
+
+export interface BackupFile {
+  name: string
+  path: string
+  size_bytes: number
+  modified_at: string
+}
+
+export interface HealthStatus {
+  status: 'ok' | 'degraded'
+  database: string
+  scheduler: {
+    started: boolean
+    in_flight?: number
+    last_error?: string
+    last_tick_at?: string | null
+    last_session_cleanup_at?: string | null
+    last_retention_sweep_at?: string | null
+  }
 }

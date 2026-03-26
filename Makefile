@@ -1,5 +1,6 @@
 GO ?= go
 NPM ?= npm
+LDFLAGS ?=
 
 .PHONY: test build frontend-install frontend-build frontend-audit audit ci release-check docker-build
 
@@ -7,7 +8,7 @@ test:
 	$(GO) test ./...
 
 build:
-	$(GO) build ./cmd/server
+	$(GO) build -ldflags "$(LDFLAGS)" ./cmd/server
 
 frontend-install:
 	$(NPM) run frontend:install

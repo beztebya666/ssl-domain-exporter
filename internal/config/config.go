@@ -12,8 +12,9 @@ import (
 )
 
 type ServerConfig struct {
-	Host string `yaml:"host" json:"host"`
-	Port string `yaml:"port" json:"port"`
+	Host           string   `yaml:"host" json:"host"`
+	Port           string   `yaml:"port" json:"port"`
+	AllowedOrigins []string `yaml:"allowed_origins" json:"allowed_origins"`
 }
 
 type DatabaseConfig struct {
@@ -122,13 +123,36 @@ type DNSConfig struct {
 	Timeout      string   `yaml:"timeout" json:"timeout"`               // DNS query timeout, e.g. "5s"
 }
 
+type SecurityConfig struct {
+	CSRFEnabled        bool   `yaml:"csrf_enabled" json:"csrf_enabled"`
+	RateLimitEnabled   bool   `yaml:"rate_limit_enabled" json:"rate_limit_enabled"`
+	LoginRequests      int    `yaml:"login_requests" json:"login_requests"`
+	LoginWindow        string `yaml:"login_window" json:"login_window"`
+	AdminWriteRequests int    `yaml:"admin_write_requests" json:"admin_write_requests"`
+	AdminWindow        string `yaml:"admin_window" json:"admin_window"`
+}
+
+type PrometheusLabelsConfig struct {
+	ExportTags     bool     `yaml:"export_tags" json:"export_tags"`
+	ExportMetadata bool     `yaml:"export_metadata" json:"export_metadata"`
+	MetadataKeys   []string `yaml:"metadata_keys" json:"metadata_keys"`
+}
+
 type PrometheusConfig struct {
-	Enabled bool   `yaml:"enabled" json:"enabled"`
-	Path    string `yaml:"path" json:"path"`
+	Enabled bool                   `yaml:"enabled" json:"enabled"`
+	Path    string                 `yaml:"path" json:"path"`
+	Labels  PrometheusLabelsConfig `yaml:"labels" json:"labels"`
 }
 
 type LoggingConfig struct {
 	JSON bool `yaml:"json" json:"json"`
+}
+
+type MaintenanceConfig struct {
+	BackupsDir             string `yaml:"backups_dir" json:"backups_dir"`
+	CheckRetentionDays     int    `yaml:"check_retention_days" json:"check_retention_days"`
+	AuditRetentionDays     int    `yaml:"audit_retention_days" json:"audit_retention_days"`
+	RetentionSweepInterval string `yaml:"retention_sweep_interval" json:"retention_sweep_interval"`
 }
 
 type Config struct {
@@ -142,8 +166,11 @@ type Config struct {
 	Notifications NotificationsConfig `yaml:"notifications" json:"notifications"`
 	Domains       DomainsConfig       `yaml:"domains" json:"domains"`
 	DNS           DNSConfig           `yaml:"dns" json:"dns"`
+	Security      SecurityConfig      `yaml:"security" json:"security"`
 	Prometheus    PrometheusConfig    `yaml:"prometheus" json:"prometheus"`
+	Maintenance   MaintenanceConfig   `yaml:"maintenance" json:"maintenance"`
 	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
+	Warnings      []string            `yaml:"-" json:"warnings,omitempty"`
 
 	mu       sync.RWMutex `yaml:"-" json:"-"`
 	filePath string       `yaml:"-" json:"-"`
@@ -153,6 +180,7 @@ func Default() *Config {
 	cfg := &Config{}
 	cfg.Server.Host = "0.0.0.0"
 	cfg.Server.Port = "8080"
+	cfg.Server.AllowedOrigins = []string{}
 	cfg.Database.Path = "./data/checker.db"
 
 	cfg.Auth.Enabled = true
@@ -202,8 +230,24 @@ func Default() *Config {
 	cfg.DNS.UseSystemDNS = true
 	cfg.DNS.Timeout = "5s"
 
+	cfg.Security.CSRFEnabled = true
+	cfg.Security.RateLimitEnabled = true
+	cfg.Security.LoginRequests = 10
+	cfg.Security.LoginWindow = "5m"
+	cfg.Security.AdminWriteRequests = 300
+	cfg.Security.AdminWindow = "1m"
+
 	cfg.Prometheus.Enabled = true
 	cfg.Prometheus.Path = "/metrics"
+	cfg.Prometheus.Labels.ExportTags = true
+	cfg.Prometheus.Labels.ExportMetadata = true
+	cfg.Prometheus.Labels.MetadataKeys = []string{}
+
+	cfg.Maintenance.BackupsDir = filepath.Join(filepath.Dir(cfg.Database.Path), "backups")
+	cfg.Maintenance.CheckRetentionDays = 0
+	cfg.Maintenance.AuditRetentionDays = 0
+	cfg.Maintenance.RetentionSweepInterval = "24h"
+
 	cfg.Logging.JSON = false
 	return cfg
 }
@@ -242,6 +286,10 @@ func (c *Config) normalize() {
 	if c.Server.Port == "" {
 		c.Server.Port = "8080"
 	}
+	if c.Server.AllowedOrigins == nil {
+		c.Server.AllowedOrigins = []string{}
+	}
+	c.Server.AllowedOrigins = normalizeStringList(c.Server.AllowedOrigins)
 	if c.Database.Path == "" {
 		c.Database.Path = "./data/checker.db"
 	}
@@ -312,6 +360,18 @@ func (c *Config) normalize() {
 	if c.DNS.Timeout == "" {
 		c.DNS.Timeout = "5s"
 	}
+	if c.Security.LoginRequests <= 0 {
+		c.Security.LoginRequests = 10
+	}
+	if c.Security.LoginWindow == "" {
+		c.Security.LoginWindow = "5m"
+	}
+	if c.Security.AdminWriteRequests <= 0 {
+		c.Security.AdminWriteRequests = 300
+	}
+	if c.Security.AdminWindow == "" {
+		c.Security.AdminWindow = "1m"
+	}
 
 	if c.Notifications.Email.Port <= 0 {
 		c.Notifications.Email.Port = 587
@@ -339,6 +399,20 @@ func (c *Config) normalize() {
 	if c.Prometheus.Path == "" {
 		c.Prometheus.Path = "/metrics"
 	}
+	if c.Prometheus.Labels.MetadataKeys == nil {
+		c.Prometheus.Labels.MetadataKeys = []string{}
+	}
+	c.Prometheus.Labels.MetadataKeys = normalizeStringList(c.Prometheus.Labels.MetadataKeys)
+
+	if c.Maintenance.BackupsDir == "" {
+		c.Maintenance.BackupsDir = filepath.Join(filepath.Dir(c.Database.Path), "backups")
+	}
+	if c.Maintenance.AuditRetentionDays < 0 {
+		c.Maintenance.AuditRetentionDays = 0
+	}
+	if c.Maintenance.RetentionSweepInterval == "" {
+		c.Maintenance.RetentionSweepInterval = "24h"
+	}
 }
 
 func (c *Config) Save() error {
@@ -356,7 +430,7 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return os.WriteFile(path, data, 0o600)
 }
 
 func (c *Config) FilePath() string {
@@ -384,18 +458,40 @@ func (c *Config) Clone() *Config {
 }
 
 func (c *Config) cloneInternal() *Config {
-	clone := *c
-	clone.mu = sync.RWMutex{}
+	clone := &Config{
+		Server:        c.Server,
+		Database:      c.Database,
+		Auth:          c.Auth,
+		Checker:       c.Checker,
+		Features:      c.Features,
+		Alerts:        c.Alerts,
+		StatusPolicy:  c.StatusPolicy,
+		Notifications: c.Notifications,
+		Domains:       c.Domains,
+		DNS:           c.DNS,
+		Security:      c.Security,
+		Prometheus:    c.Prometheus,
+		Maintenance:   c.Maintenance,
+		Logging:       c.Logging,
+		filePath:      c.filePath,
+	}
 	// Deep copy slices
 	if c.DNS.Servers != nil {
-		clone.DNS.Servers = make([]string, len(c.DNS.Servers))
-		copy(clone.DNS.Servers, c.DNS.Servers)
+		clone.DNS.Servers = append([]string(nil), c.DNS.Servers...)
+	}
+	if c.Server.AllowedOrigins != nil {
+		clone.Server.AllowedOrigins = append([]string(nil), c.Server.AllowedOrigins...)
 	}
 	if c.Notifications.Email.To != nil {
-		clone.Notifications.Email.To = make([]string, len(c.Notifications.Email.To))
-		copy(clone.Notifications.Email.To, c.Notifications.Email.To)
+		clone.Notifications.Email.To = append([]string(nil), c.Notifications.Email.To...)
 	}
-	return &clone
+	if c.Prometheus.Labels.MetadataKeys != nil {
+		clone.Prometheus.Labels.MetadataKeys = append([]string(nil), c.Prometheus.Labels.MetadataKeys...)
+	}
+	if c.Warnings != nil {
+		clone.Warnings = append([]string(nil), c.Warnings...)
+	}
+	return clone
 }
 
 // ApplyFrom replaces the config contents under write lock.
@@ -417,8 +513,11 @@ func (c *Config) ApplyFrom(in *Config) {
 	c.Notifications = next.Notifications
 	c.Domains = next.Domains
 	c.DNS = next.DNS
+	c.Security = next.Security
 	c.Prometheus = next.Prometheus
+	c.Maintenance = next.Maintenance
 	c.Logging = next.Logging
+	c.Warnings = nil
 	c.normalize()
 	c.filePath = filePath
 	c.mu.Unlock()
@@ -430,6 +529,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("SERVER_PORT"); v != "" {
 		cfg.Server.Port = v
+	}
+	if v := os.Getenv("SERVER_ALLOWED_ORIGINS"); v != "" {
+		cfg.Server.AllowedOrigins = normalizeCommaList(v)
 	}
 	if v := os.Getenv("DATABASE_PATH"); v != "" {
 		cfg.Database.Path = v
@@ -457,8 +559,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AUTH_PASSWORD"); v != "" {
 		cfg.Auth.Password = v
+	} else if v, ok := lookupEnvFile("AUTH_PASSWORD_FILE"); ok {
+		cfg.Auth.Password = v
 	}
 	if v := os.Getenv("AUTH_API_KEY"); v != "" {
+		cfg.Auth.APIKey = v
+	} else if v, ok := lookupEnvFile("AUTH_API_KEY_FILE"); ok {
 		cfg.Auth.APIKey = v
 	}
 	if v := os.Getenv("AUTH_PROTECT_API"); v != "" {
@@ -516,6 +622,8 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("WEBHOOK_URL"); v != "" {
 		cfg.Notifications.Webhook.URL = v
+	} else if v, ok := lookupEnvFile("WEBHOOK_URL_FILE"); ok {
+		cfg.Notifications.Webhook.URL = v
 	}
 	if v := os.Getenv("WEBHOOK_ON_CRITICAL"); v != "" {
 		cfg.Notifications.Webhook.OnCritical = ParseBool(v)
@@ -531,6 +639,8 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Notifications.Telegram.Enabled = ParseBool(v)
 	}
 	if v := os.Getenv("TELEGRAM_BOT_TOKEN"); v != "" {
+		cfg.Notifications.Telegram.BotToken = v
+	} else if v, ok := lookupEnvFile("TELEGRAM_BOT_TOKEN_FILE"); ok {
 		cfg.Notifications.Telegram.BotToken = v
 	}
 	if v := os.Getenv("TELEGRAM_CHAT_ID"); v != "" {
@@ -557,6 +667,8 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Notifications.Email.Username = v
 	}
 	if v := os.Getenv("EMAIL_PASSWORD"); v != "" {
+		cfg.Notifications.Email.Password = v
+	} else if v, ok := lookupEnvFile("EMAIL_PASSWORD_FILE"); ok {
 		cfg.Notifications.Email.Password = v
 	}
 	if v := os.Getenv("EMAIL_FROM"); v != "" {
@@ -620,11 +732,59 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.DNS.Timeout = v
 	}
 
+	if v := os.Getenv("SECURITY_CSRF_ENABLED"); v != "" {
+		cfg.Security.CSRFEnabled = ParseBool(v)
+	}
+	if v := os.Getenv("SECURITY_RATE_LIMIT_ENABLED"); v != "" {
+		cfg.Security.RateLimitEnabled = ParseBool(v)
+	}
+	if v := os.Getenv("SECURITY_LOGIN_REQUESTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Security.LoginRequests = n
+		}
+	}
+	if v := os.Getenv("SECURITY_LOGIN_WINDOW"); v != "" {
+		cfg.Security.LoginWindow = v
+	}
+	if v := os.Getenv("SECURITY_ADMIN_WRITE_REQUESTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Security.AdminWriteRequests = n
+		}
+	}
+	if v := os.Getenv("SECURITY_ADMIN_WINDOW"); v != "" {
+		cfg.Security.AdminWindow = v
+	}
+
 	if v := os.Getenv("PROMETHEUS_ENABLED"); v != "" {
 		cfg.Prometheus.Enabled = ParseBool(v)
 	}
 	if v := os.Getenv("PROMETHEUS_PATH"); v != "" {
 		cfg.Prometheus.Path = v
+	}
+	if v := os.Getenv("PROMETHEUS_EXPORT_TAGS"); v != "" {
+		cfg.Prometheus.Labels.ExportTags = ParseBool(v)
+	}
+	if v := os.Getenv("PROMETHEUS_EXPORT_METADATA"); v != "" {
+		cfg.Prometheus.Labels.ExportMetadata = ParseBool(v)
+	}
+	if v := os.Getenv("PROMETHEUS_METADATA_KEYS"); v != "" {
+		cfg.Prometheus.Labels.MetadataKeys = normalizeCommaList(v)
+	}
+	if v := os.Getenv("MAINTENANCE_BACKUPS_DIR"); v != "" {
+		cfg.Maintenance.BackupsDir = v
+	}
+	if v := os.Getenv("MAINTENANCE_CHECK_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Maintenance.CheckRetentionDays = n
+		}
+	}
+	if v := os.Getenv("MAINTENANCE_AUDIT_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Maintenance.AuditRetentionDays = n
+		}
+	}
+	if v := os.Getenv("MAINTENANCE_RETENTION_SWEEP_INTERVAL"); v != "" {
+		cfg.Maintenance.RetentionSweepInterval = v
 	}
 	if v := os.Getenv("LOG_JSON"); v != "" {
 		cfg.Logging.JSON = ParseBool(v)
@@ -647,4 +807,42 @@ func ValidateCheckMode(mode string) string {
 		return "ssl_only"
 	}
 	return "full"
+}
+
+func lookupEnvFile(name string) (string, bool) {
+	path := strings.TrimSpace(os.Getenv(name))
+	if path == "" {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(data)), true
+}
+
+func normalizeCommaList(raw string) []string {
+	parts := strings.Split(raw, ",")
+	return normalizeStringList(parts)
+}
+
+func normalizeStringList(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }

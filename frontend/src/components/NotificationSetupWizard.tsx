@@ -1,9 +1,8 @@
 import { useMemo, useState } from 'react'
 import { Bell, Mail, Send, Webhook } from 'lucide-react'
 import type { Dispatch, SetStateAction } from 'react'
-import type { AppConfig, NotificationDeliveryStatus, NotificationTestResult } from '../types'
-
-type Channel = 'email' | 'webhook' | 'telegram'
+import SecretInput from './SecretInput'
+import type { AppConfig, NotificationChannel, NotificationDeliveryStatus, NotificationTestResult } from '../types'
 
 type Props = {
   form: AppConfig
@@ -11,7 +10,7 @@ type Props = {
   notificationStatus: NotificationDeliveryStatus[]
   notificationTestResults: NotificationTestResult[]
   testing: boolean
-  onSendTest: () => void
+  onSendTest: (channel: NotificationChannel) => void
 }
 
 const wizardSteps = ['Channel', 'Connection', 'Routing', 'Test'] as const
@@ -24,7 +23,7 @@ export default function NotificationSetupWizard({
   testing,
   onSendTest,
 }: Props) {
-  const [channel, setChannel] = useState<Channel>('email')
+  const [channel, setChannel] = useState<NotificationChannel>('email')
   const [stepIndex, setStepIndex] = useState(0)
 
   const currentStatus = useMemo(
@@ -35,7 +34,8 @@ export default function NotificationSetupWizard({
     () => notificationTestResults.find(item => item.channel === channel),
     [channel, notificationTestResults],
   )
-  const emailRecipients = useMemo(() => form.notifications.email.to.join(', '), [form.notifications.email.to])
+  const currentChannelEnabled = channelEnabledFromForm(form, channel)
+  const emailRecipients = useMemo(() => (form.notifications.email.to ?? []).join(', '), [form.notifications.email.to])
 
   const setChannelEnabled = (enabled: boolean) => {
     setForm(current => {
@@ -156,7 +156,7 @@ export default function NotificationSetupWizard({
               </select>
             </Field>
             <Field label={`${channelLabel(channel)} channel`}>
-              <select className="select" value={channelValue(currentStatus?.enabled)} onChange={e => setChannelEnabled(e.target.value === 'true')}>
+              <select className="select" value={channelValue(currentChannelEnabled)} onChange={e => setChannelEnabled(e.target.value === 'true')}>
                 <option value="true">Enabled</option>
                 <option value="false">Disabled</option>
               </select>
@@ -185,7 +185,11 @@ export default function NotificationSetupWizard({
                   <input className="input" value={form.notifications.email.username} onChange={e => setChannelPatch({ username: e.target.value })} />
                 </Field>
                 <Field label="SMTP password">
-                  <input className="input" type="password" value={form.notifications.email.password} onChange={e => setChannelPatch({ password: e.target.value })} />
+                  <SecretInput
+                    value={form.notifications.email.password}
+                    ariaLabel="SMTP password"
+                    onChange={value => setChannelPatch({ password: value })}
+                  />
                 </Field>
                 <Field label="From address">
                   <input className="input" value={form.notifications.email.from} onChange={e => setChannelPatch({ from: e.target.value })} />
@@ -196,7 +200,12 @@ export default function NotificationSetupWizard({
             {channel === 'webhook' && (
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <Field label="Webhook URL">
-                  <input className="input" value={form.notifications.webhook.url} onChange={e => setChannelPatch({ url: e.target.value })} />
+                  <SecretInput
+                    type="text"
+                    value={form.notifications.webhook.url}
+                    ariaLabel="Webhook URL"
+                    onChange={value => setChannelPatch({ url: value })}
+                  />
                 </Field>
                 <Field label="Delivery mode">
                   <div className="rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3 text-sm text-slate-300">
@@ -209,7 +218,11 @@ export default function NotificationSetupWizard({
             {channel === 'telegram' && (
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <Field label="Bot token">
-                  <input className="input" value={form.notifications.telegram.bot_token} onChange={e => setChannelPatch({ bot_token: e.target.value })} />
+                  <SecretInput
+                    value={form.notifications.telegram.bot_token}
+                    ariaLabel="Telegram bot token"
+                    onChange={value => setChannelPatch({ bot_token: value })}
+                  />
                 </Field>
                 <Field label="Chat ID">
                   <input className="input" value={form.notifications.telegram.chat_id} onChange={e => setChannelPatch({ chat_id: e.target.value })} />
@@ -258,8 +271,8 @@ export default function NotificationSetupWizard({
               <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-sm">
                 <div className="flex items-center justify-between gap-3">
                   <div className="font-medium text-white">{channelLabel(channel)} status</div>
-                  <span className={`rounded-full px-2 py-1 text-[11px] ${currentStatus?.enabled ? 'bg-emerald-500/10 text-emerald-300' : 'bg-slate-700 text-slate-300'}`}>
-                    {currentStatus?.enabled ? 'enabled' : 'disabled'}
+                  <span className={`rounded-full px-2 py-1 text-[11px] ${currentChannelEnabled ? 'bg-emerald-500/10 text-emerald-300' : 'bg-slate-700 text-slate-300'}`}>
+                    {currentChannelEnabled ? 'enabled' : 'disabled'}
                   </span>
                 </div>
                 <div className="mt-3 space-y-1 text-xs text-slate-400">
@@ -276,7 +289,7 @@ export default function NotificationSetupWizard({
                 <div className="mt-2 text-xs text-slate-400">
                   Send a real test notification through the selected channel with the current configuration values.
                 </div>
-                <button className="btn-primary mt-4" onClick={onSendTest} disabled={testing}>
+                <button className="btn-primary mt-4" onClick={() => onSendTest(channel)} disabled={testing}>
                   {testing ? 'Sending test...' : `Send ${channelLabel(channel).toLowerCase()} test`}
                 </button>
                 {currentTest && (
@@ -347,7 +360,7 @@ function Field({
   )
 }
 
-function channelLabel(channel: Channel): string {
+function channelLabel(channel: NotificationChannel): string {
   switch (channel) {
     case 'email':
       return 'Email'
@@ -362,7 +375,18 @@ function channelValue(value: boolean | undefined): 'true' | 'false' {
   return value ? 'true' : 'false'
 }
 
-function currentTriggers(form: AppConfig, channel: Channel): { onCritical: boolean; onWarning: boolean } {
+function channelEnabledFromForm(form: AppConfig, channel: NotificationChannel): boolean {
+  switch (channel) {
+    case 'email':
+      return form.notifications.email.enabled
+    case 'webhook':
+      return form.notifications.webhook.enabled
+    default:
+      return form.notifications.telegram.enabled
+  }
+}
+
+function currentTriggers(form: AppConfig, channel: NotificationChannel): { onCritical: boolean; onWarning: boolean } {
   switch (channel) {
     case 'email':
       return { onCritical: form.notifications.email.on_critical, onWarning: form.notifications.email.on_warning }
@@ -375,7 +399,7 @@ function currentTriggers(form: AppConfig, channel: Channel): { onCritical: boole
 
 function setTrigger(
   setChannelPatch: (patch: Record<string, unknown>) => void,
-  channel: Channel,
+  channel: NotificationChannel,
   key: 'onCritical' | 'onWarning',
   value: boolean,
 ) {
@@ -383,7 +407,7 @@ function setTrigger(
     email: { onCritical: 'on_critical', onWarning: 'on_warning' },
     webhook: { onCritical: 'on_critical', onWarning: 'on_warning' },
     telegram: { onCritical: 'on_critical', onWarning: 'on_warning' },
-  } satisfies Record<Channel, Record<'onCritical' | 'onWarning', string>>
+  } satisfies Record<NotificationChannel, Record<'onCritical' | 'onWarning', string>>
 
   setChannelPatch({ [mapping[channel][key]]: value })
 }

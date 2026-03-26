@@ -691,6 +691,70 @@ func TestCustomFieldHandlersCRUD(t *testing.T) {
 	}
 }
 
+func TestDeleteDomainReturnsNotFoundWhenDomainDoesNotExist(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := config.Default()
+	database := newHandlerTestDB(t)
+	defer database.Close()
+
+	handler := NewHandler(cfg, database, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/api/domains/999", nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "999"}}
+
+	handler.DeleteDomain(ctx)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing domain, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetSummaryNormalizesUnknownStatuses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := config.Default()
+	database := newHandlerTestDB(t)
+	defer database.Close()
+
+	domain, err := database.CreateDomain("mystery.internal", nil, nil, "", "full", "", 3600, 443, nil)
+	if err != nil {
+		t.Fatalf("create domain: %v", err)
+	}
+	if err := database.SaveCheck(&db.Check{
+		DomainID:      domain.ID,
+		CheckedAt:     time.Now().UTC(),
+		SSLChainValid: true,
+		OverallStatus: "mystery",
+		CheckDuration: 10,
+	}); err != nil {
+		t.Fatalf("save check: %v", err)
+	}
+
+	handler := NewHandler(cfg, database, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+
+	handler.GetSummary(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var summary map[string]int
+	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if summary["unknown"] != 1 {
+		t.Fatalf("expected unknown summary bucket to be incremented, got %+v", summary)
+	}
+	if _, ok := summary["mystery"]; ok {
+		t.Fatalf("expected unexpected status to be normalized away, got %+v", summary)
+	}
+}
+
 func newHandlerTestDB(t *testing.T) *db.DB {
 	t.Helper()
 

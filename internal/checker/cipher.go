@@ -113,6 +113,7 @@ func CheckCipherSuite(domain string, port int, timeout time.Duration, rc *Resolv
 
 func tlsProbe(host, serverName string, timeout time.Duration, minVersion, maxVersion uint16, suites []uint16) (*tls.ConnectionState, error) {
 	dialer := &net.Dialer{Timeout: timeout}
+	//nolint:gosec // Cipher probing intentionally bypasses chain validation to measure protocol/cipher support on broken endpoints too.
 	conf := &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         serverName,

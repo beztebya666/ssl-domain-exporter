@@ -2,14 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -28,9 +29,18 @@ var (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	configPath := flag.String("config", "", "path to config file (default: ./config.yaml or $CONFIG_PATH)")
 	configDir := flag.String("config-dir", "", "directory for config/data defaults (optional)")
+	backupPath := flag.String("backup", "", "create a sqlite backup at the provided path and exit")
+	restorePath := flag.String("restore", "", "restore the sqlite database from the provided backup path and exit")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+	if *showVersion {
+		printVersion(os.Stdout)
+		return
+	}
 
 	if *configDir == "" {
 		if v := os.Getenv("CONFIG_DIR"); v != "" {
@@ -50,50 +60,61 @@ func main() {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Printf("Warning: config load error (%v), using defaults", err)
+		slog.Warn("Config load error, using defaults", "error", err)
 	}
-	log.Printf("Config: %s", cfg.FilePath())
+	configureLogger(cfg)
+	slog.Info("Config loaded", "path", cfg.FilePath())
 
 	if *configDir != "" {
 		defaultDB := "./data/checker.db"
 		if cfg.Database.Path == "" || cfg.Database.Path == defaultDB {
 			cfg.Database.Path = filepath.Join(*configDir, "checker.db")
 			if saveErr := cfg.Save(); saveErr != nil {
-				log.Printf("Warning: failed to save config with config-dir defaults: %v", saveErr)
+				slog.Warn("Failed to save config with config-dir defaults", "error", saveErr)
 			}
 		}
 	}
-
-	if cfg.Logging.JSON || cfg.Features.StructuredLogs {
-		log.SetFlags(0)
-		log.SetOutput(jsonLogWriter{})
-		log.Println("structured logging enabled")
+	if *restorePath != "" {
+		if err := db.RestoreSQLiteFile(*restorePath, cfg.Database.Path); err != nil {
+			fatal("Restore failed", "error", err)
+		}
+		slog.Info("Database restored", "source", *restorePath, "destination", cfg.Database.Path)
+		return
+	}
+	for _, warning := range cfg.InsecureWarnings() {
+		slog.Warn("Security warning", "warning", warning)
 	}
 
-	log.Printf("Version: app=%s ui=%s commit=%s build_time=%s", AppVersion, UIVersion, GitCommit, BuildTime)
+	slog.Info("Version info", "app", AppVersion, "ui", UIVersion, "commit", GitCommit, "build_time", BuildTime)
 
 	database, err := db.New(cfg.Database.Path)
 	if err != nil {
-		log.Fatalf("DB init failed: %v", err)
+		fatal("DB init failed", "error", err)
 	}
 	defer database.Close()
 
 	if err := database.Migrate(); err != nil {
-		log.Fatalf("DB migrate failed: %v", err)
+		fatal("DB migrate failed", "error", err)
+	}
+	if *backupPath != "" {
+		if err := database.BackupTo(*backupPath); err != nil {
+			fatal("Backup failed", "error", err)
+		}
+		slog.Info("Database backup created", "path", *backupPath)
+		return
 	}
 
-	m := metrics.New()
+	m := metrics.New(cfg)
 	if domains, err := database.GetDomains(); err == nil {
 		m.SyncDomains(domains)
 		m.SetTotalDomains(len(domains))
 	} else {
-		log.Printf("Warning: failed to preload domain metrics: %v", err)
+		slog.Warn("Failed to preload domain metrics", "error", err)
 	}
 	notifier := checker.NewNotifier(cfg)
 	chk := checker.New(cfg, database, m, notifier)
 	sched := checker.NewScheduler(cfg, database, chk, m)
 	sched.Start()
-	defer sched.Stop()
 
 	router := api.NewRouter(cfg, database, chk, sched, m)
 
@@ -105,46 +126,69 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	serverErrCh := make(chan error, 1)
 	go func() {
-		log.Printf("Server starting on http://%s:%s", cfg.Server.Host, cfg.Server.Port)
+		slog.Info("Server starting", "url", "http://"+cfg.Server.Host+":"+cfg.Server.Port)
 		if cfg.Prometheus.Enabled {
-			log.Printf("Prometheus metrics at http://%s:%s%s", cfg.Server.Host, cfg.Server.Port, cfg.Prometheus.Path)
+			slog.Info("Prometheus metrics exposed", "url", "http://"+cfg.Server.Host+":"+cfg.Server.Port+cfg.Prometheus.Path)
 		}
 		if cfg.Auth.Enabled {
-			log.Printf("Auth enabled (mode=%s user=%s)", cfg.Auth.Mode, cfg.Auth.Username)
+			slog.Info("Authentication enabled", "mode", cfg.Auth.Mode, "user", cfg.Auth.Username)
 		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
+			serverErrCh <- err
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	defer signal.Stop(quit)
 
-	log.Println("Shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	exitCode := 0
+	select {
+	case sig := <-quit:
+		slog.Info("Shutting down", "signal", sig.String())
+	case err := <-serverErrCh:
+		exitCode = 1
+		slog.Error("Server error", "error", err)
+	}
+
+	httpCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
-	log.Println("Bye")
+	if err := srv.Shutdown(httpCtx); err != nil {
+		slog.Error("HTTP shutdown failed", "error", err)
+	}
+	sched.Stop()
+	notifierCtx, notifierCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer notifierCancel()
+	if err := notifier.Stop(notifierCtx); err != nil {
+		slog.Warn("Notifier drain timed out", "error", err)
+	}
+	slog.Info("Shutdown complete")
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }
 
-type jsonLogWriter struct{}
+func configureLogger(cfg *config.Config) {
+	handlerOpts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	var handler slog.Handler
+	if cfg != nil && (cfg.Logging.JSON || cfg.Features.StructuredLogs) {
+		handler = slog.NewJSONHandler(os.Stdout, handlerOpts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, handlerOpts)
+	}
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+	log.SetFlags(0)
+	log.SetOutput(io.Discard)
+}
 
-func (w jsonLogWriter) Write(p []byte) (int, error) {
-	msg := strings.TrimSpace(string(p))
-	if msg == "" {
-		return len(p), nil
-	}
-	entry := map[string]string{
-		"ts":    time.Now().UTC().Format(time.RFC3339Nano),
-		"level": "info",
-		"msg":   msg,
-	}
-	b, err := json.Marshal(entry)
-	if err != nil {
-		return os.Stdout.Write(p)
-	}
-	_, err = os.Stdout.Write(append(b, '\n'))
-	return len(p), err
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
+func printVersion(w io.Writer) {
+	_, _ = fmt.Fprintf(w, "ssl-domain-exporter app=%s ui=%s commit=%s build_time=%s\n", AppVersion, UIVersion, GitCommit, BuildTime)
 }

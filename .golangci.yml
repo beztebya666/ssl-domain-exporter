@@ -1,0 +1,13 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused

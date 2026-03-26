@@ -36,18 +36,30 @@ type Metrics struct {
 	DomainTagInfo            *prometheus.GaugeVec
 	DomainMetadataInfo       *prometheus.GaugeVec
 
+	cfg            *config.Config
 	mu             sync.Mutex
 	domainTags     map[string]map[string]struct{}
 	domainMetadata map[string]map[string]struct{}
 }
 
-func New() *Metrics {
-	return NewWithRegisterer(prometheus.DefaultRegisterer)
+type exportSettings struct {
+	exportTags     bool
+	exportMetadata bool
+	metadataKeys   map[string]struct{}
+}
+
+func New(cfg *config.Config) *Metrics {
+	return NewWithConfigAndRegisterer(cfg, prometheus.DefaultRegisterer)
 }
 
 // NewWithRegisterer creates metrics on the provided registry.
 // Tests use this to avoid polluting the global Prometheus registry.
 func NewWithRegisterer(reg prometheus.Registerer) *Metrics {
+	return NewWithConfigAndRegisterer(nil, reg)
+}
+
+// NewWithConfigAndRegisterer creates metrics bound to a live config object.
+func NewWithConfigAndRegisterer(cfg *config.Config, reg prometheus.Registerer) *Metrics {
 	if reg == nil {
 		reg = prometheus.DefaultRegisterer
 	}
@@ -159,23 +171,29 @@ func NewWithRegisterer(reg prometheus.Registerer) *Metrics {
 			Help: "Static domain metadata info metric with value 1 for each domain metadata key/value pair",
 		}, []string{"domain", "key", "value"}),
 
+		cfg:            cfg,
 		domainTags:     make(map[string]map[string]struct{}),
 		domainMetadata: make(map[string]map[string]struct{}),
 	}
 }
 
 func (m *Metrics) SyncDomains(domains []db.Domain) {
+	settings := m.exportSettings(nil)
 	for i := range domains {
-		m.SyncDomain(&domains[i])
+		m.syncDomain(&domains[i], settings)
 	}
 }
 
 func (m *Metrics) SyncDomain(domain *db.Domain) {
+	m.syncDomain(domain, m.exportSettings(nil))
+}
+
+func (m *Metrics) syncDomain(domain *db.Domain, settings exportSettings) {
 	if domain == nil {
 		return
 	}
-	m.syncDomainTags(domain.Name, domain.Tags)
-	m.syncDomainMetadata(domain.Name, domain.Metadata)
+	m.syncDomainTags(domain.Name, domain.Tags, settings)
+	m.syncDomainMetadata(domain.Name, domain.Metadata, settings)
 	if domain.RegistrationCheckEnabled() {
 		m.RegistrationCheckEnabled.WithLabelValues(domain.Name).Set(1)
 	} else {
@@ -190,7 +208,7 @@ func (m *Metrics) UpdateDomain(domain *db.Domain, check *db.Check, cfg *config.C
 		return
 	}
 	name := domain.Name
-	m.SyncDomain(domain)
+	m.syncDomain(domain, m.exportSettings(cfg))
 
 	registrationSkipped := check.RegistrationCheckSkipped
 
@@ -295,14 +313,16 @@ func (m *Metrics) CleanupDomain(domain string) {
 	}
 }
 
-func (m *Metrics) syncDomainTags(domain string, tags []string) {
+func (m *Metrics) syncDomainTags(domain string, tags []string, settings exportSettings) {
 	normalized := make(map[string]struct{}, len(tags))
-	for _, tag := range tags {
-		tag = strings.TrimSpace(tag)
-		if tag == "" {
-			continue
+	if settings.exportTags {
+		for _, tag := range tags {
+			tag = strings.TrimSpace(tag)
+			if tag == "" {
+				continue
+			}
+			normalized[tag] = struct{}{}
 		}
-		normalized[tag] = struct{}{}
 	}
 
 	m.mu.Lock()
@@ -320,15 +340,17 @@ func (m *Metrics) syncDomainTags(domain string, tags []string) {
 	m.domainTags[domain] = normalized
 }
 
-func (m *Metrics) syncDomainMetadata(domain string, metadata map[string]string) {
+func (m *Metrics) syncDomainMetadata(domain string, metadata map[string]string, settings exportSettings) {
 	normalized := make(map[string]struct{}, len(metadata))
-	for key, value := range metadata {
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if key == "" || value == "" {
-			continue
+	if settings.exportMetadata {
+		for key, value := range metadata {
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if key == "" || value == "" || !settings.metadataKeyAllowed(key) {
+				continue
+			}
+			normalized[joinMetricPair(key, value)] = struct{}{}
 		}
-		normalized[joinMetricPair(key, value)] = struct{}{}
 	}
 
 	m.mu.Lock()
@@ -410,4 +432,39 @@ func revocationToFloat(status string) float64 {
 	default:
 		return 0
 	}
+}
+
+func (m *Metrics) exportSettings(cfg *config.Config) exportSettings {
+	settings := exportSettings{
+		exportTags:     true,
+		exportMetadata: true,
+	}
+	if cfg == nil {
+		if m == nil || m.cfg == nil {
+			return settings
+		}
+		cfg = m.cfg.Snapshot()
+	}
+	settings.exportTags = cfg.Prometheus.Labels.ExportTags
+	settings.exportMetadata = cfg.Prometheus.Labels.ExportMetadata
+	if len(cfg.Prometheus.Labels.MetadataKeys) == 0 {
+		return settings
+	}
+	settings.metadataKeys = make(map[string]struct{}, len(cfg.Prometheus.Labels.MetadataKeys))
+	for _, key := range cfg.Prometheus.Labels.MetadataKeys {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			continue
+		}
+		settings.metadataKeys[key] = struct{}{}
+	}
+	return settings
+}
+
+func (s exportSettings) metadataKeyAllowed(key string) bool {
+	if len(s.metadataKeys) == 0 {
+		return true
+	}
+	_, ok := s.metadataKeys[strings.ToLower(strings.TrimSpace(key))]
+	return ok
 }

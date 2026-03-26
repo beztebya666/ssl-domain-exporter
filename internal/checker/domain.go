@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"strings"
@@ -58,18 +58,18 @@ func CheckDomainRegistration(domain string, timeout time.Duration) *DomainResult
 	rdapResult := checkRDAP(domain, timeout)
 	if rdapResult.Error == "" {
 		rdapResult.Source = "rdap"
-		log.Printf("[domain] %s: RDAP ok (expires in %v days)", domain, ptrStr(rdapResult.ExpiryDays))
+		slog.Info("RDAP lookup succeeded", "domain", domain, "expiry_days", ptrStr(rdapResult.ExpiryDays))
 		return rdapResult
 	}
-	log.Printf("[domain] %s: RDAP failed (%s), trying WHOIS", domain, rdapResult.Error)
+	slog.Warn("RDAP lookup failed, trying WHOIS", "domain", domain, "error", rdapResult.Error)
 
 	whoisResult := checkWHOIS(domain, timeout)
 	if whoisResult.Error == "" {
 		whoisResult.Source = "whois"
-		log.Printf("[domain] %s: WHOIS ok (expires in %v days)", domain, ptrStr(whoisResult.ExpiryDays))
+		slog.Info("WHOIS lookup succeeded", "domain", domain, "expiry_days", ptrStr(whoisResult.ExpiryDays))
 		return whoisResult
 	}
-	log.Printf("[domain] %s: WHOIS failed (%s)", domain, whoisResult.Error)
+	slog.Warn("WHOIS lookup failed", "domain", domain, "error", whoisResult.Error)
 
 	rdapResult.Source = "failed"
 	rdapResult.Error = fmt.Sprintf("RDAP: %s | WHOIS: %s", rdapResult.Error, whoisResult.Error)
@@ -130,7 +130,7 @@ func getRDAPBootstrap(timeout time.Duration) (map[string]string, error) {
 
 	bootstrapCache = result
 	bootstrapCacheTime = time.Now()
-	log.Printf("[rdap] bootstrap cached: %d TLDs", len(result))
+	slog.Info("RDAP bootstrap cached", "tlds", len(result))
 	return result, nil
 }
 
