@@ -1,6 +1,16 @@
 # SSL Domain Exporter
 
-![image](/docs/screenshots/main_screen.png)
+## Interface Preview
+
+| Dashboard | Domains |
+| --- | --- |
+| [![Dashboard preview](docs/screenshots/main_dashboard.png)](docs/screenshots/main_dashboard.png) | [![Domains inventory preview](docs/screenshots/main_domains.png)](docs/screenshots/main_domains.png) |
+| Operational summary, filters, and watchlists. | Inventory list with folders, search, and custom ordering. |
+
+| Domain Details | Administration |
+| --- | --- |
+| [![Domain detail preview](docs/screenshots/main_info.png)](docs/screenshots/main_info.png) | [![Administration preview](docs/screenshots/main_settings.png)](docs/screenshots/main_settings.png) |
+| Certificate chain, registration, history, and validation context. | Guided notifications, access controls, health, and maintenance. |
 
 > Screenshot note: the exact interface can vary slightly by theme, viewport, and release build. The current UI includes responsive navigation, toast feedback, guided notification setup, and status-focused dashboard sections.
 

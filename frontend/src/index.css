@@ -279,6 +279,14 @@
     background-color: rgb(249 250 251 / 0.6);
   }
 
+  .theme-light .bg-slate-950\/30 {
+    background-color: rgb(248 250 252 / 0.82);
+  }
+
+  .theme-light .bg-slate-950\/95 {
+    background-color: rgb(255 255 255 / 0.98);
+  }
+
   /* ── Slate text ── */
   .theme-light .text-slate-100 {
     color: rgb(17 24 39);
@@ -297,7 +305,7 @@
   }
 
   .theme-light .text-slate-500 {
-    color: rgb(107 114 128);
+    color: rgb(71 85 105);
   }
 
   .theme-light .text-white {
@@ -381,11 +389,11 @@
   }
 
   .theme-light .text-gray-500 {
-    color: rgb(107 114 128);
+    color: rgb(71 85 105);
   }
 
   .theme-light .text-gray-600 {
-    color: rgb(107 114 128);
+    color: rgb(71 85 105);
   }
 
   /* ── Gray borders ── */
