@@ -23,7 +23,7 @@ type CustomField struct {
 	VisibleInExport  bool                `json:"visible_in_export"`
 	Filterable       bool                `json:"filterable"`
 	Enabled          bool                `json:"enabled"`
-	Options          []CustomFieldOption `json:"options,omitempty"`
+	Options          []CustomFieldOption `json:"options"`
 	CreatedAt        time.Time           `json:"created_at"`
 	UpdatedAt        time.Time           `json:"updated_at"`
 }
@@ -93,7 +93,7 @@ func (d *DB) ListCustomFields(includeDisabled bool) ([]CustomField, error) {
 		return nil, err
 	}
 	for i := range fields {
-		fields[i].Options = optionsByField[fields[i].ID]
+		fields[i].Options = ensureCustomFieldOptions(optionsByField[fields[i].ID])
 	}
 	return fields, nil
 }
@@ -117,7 +117,7 @@ func (d *DB) GetCustomFieldByID(id int64) (*CustomField, error) {
 	if err != nil {
 		return nil, err
 	}
-	field.Options = optionsByField[id]
+	field.Options = ensureCustomFieldOptions(optionsByField[id])
 	return field, nil
 }
 
@@ -430,4 +430,11 @@ func defaultCustomFieldLabel(key string) string {
 		parts[i] = strings.ToUpper(part[:1]) + part[1:]
 	}
 	return strings.Join(parts, " ")
+}
+
+func ensureCustomFieldOptions(options []CustomFieldOption) []CustomFieldOption {
+	if options == nil {
+		return []CustomFieldOption{}
+	}
+	return options
 }

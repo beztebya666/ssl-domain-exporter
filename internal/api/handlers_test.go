@@ -620,6 +620,41 @@ func TestCustomFieldHandlersCRUD(t *testing.T) {
 		t.Fatalf("unexpected created field: %+v", created)
 	}
 
+	textPayload := map[string]any{
+		"key":                "owner",
+		"label":              "Owner",
+		"type":               "text",
+		"required":           false,
+		"visible_in_table":   true,
+		"visible_in_details": true,
+		"visible_in_export":  true,
+		"filterable":         true,
+		"enabled":            true,
+	}
+	textBody, err := json.Marshal(textPayload)
+	if err != nil {
+		t.Fatalf("marshal text field payload: %v", err)
+	}
+
+	textRec := httptest.NewRecorder()
+	textCtx, _ := gin.CreateTestContext(textRec)
+	textCtx.Request = httptest.NewRequest(http.MethodPost, "/api/custom-fields", bytes.NewReader(textBody))
+	textCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.CreateCustomField(textCtx)
+
+	if textRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected text field create status: got %d body=%s", textRec.Code, textRec.Body.String())
+	}
+
+	var textField db.CustomField
+	if err := json.Unmarshal(textRec.Body.Bytes(), &textField); err != nil {
+		t.Fatalf("decode text field: %v", err)
+	}
+	if textField.Options == nil {
+		t.Fatal("expected text custom field response to include an empty options array")
+	}
+
 	updatePayload := map[string]any{
 		"key":                "service_tier",
 		"label":              "Service Tier",
@@ -667,7 +702,16 @@ func TestCustomFieldHandlersCRUD(t *testing.T) {
 	if err := json.Unmarshal(listRec.Body.Bytes(), &fields); err != nil {
 		t.Fatalf("decode listed fields: %v", err)
 	}
-	if len(fields) != 1 || fields[0].Enabled {
+	if len(fields) != 2 {
+		t.Fatalf("expected two fields in list, got %+v", fields)
+	}
+	if fields[0].Options == nil || fields[1].Options == nil {
+		t.Fatalf("expected listed custom fields to always include options arrays, got %+v", fields)
+	}
+	if fields[0].Key == "service_tier" && fields[0].Enabled {
+		t.Fatalf("expected service_tier to be disabled, got %+v", fields[0])
+	}
+	if fields[1].Key == "service_tier" && fields[1].Enabled {
 		t.Fatalf("expected one disabled field, got %+v", fields)
 	}
 
@@ -680,6 +724,10 @@ func TestCustomFieldHandlersCRUD(t *testing.T) {
 
 	if deleteRec.Code != http.StatusOK {
 		t.Fatalf("unexpected delete status: got %d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	if err := database.DeleteCustomField(textField.ID); err != nil {
+		t.Fatalf("delete text field: %v", err)
 	}
 
 	remaining, err := database.ListCustomFields(true)

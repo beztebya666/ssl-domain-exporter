@@ -446,7 +446,7 @@ export default function Dashboard({ bootstrap }: DashboardProps) {
                           }}
                         >
                           <option value="">All</option>
-                          {field.options.map(option => (
+                          {(field.options ?? []).map(option => (
                             <option key={`${field.key}-${option.value}`} value={option.value}>{option.label}</option>
                           ))}
                         </select>

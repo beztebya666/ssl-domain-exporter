@@ -468,6 +468,9 @@ func TestCustomFieldSchemaCRUDAndValidation(t *testing.T) {
 	if field.Key != "owner_email" || field.Type != "email" {
 		t.Fatalf("unexpected created field: %+v", field)
 	}
+	if field.Options == nil {
+		t.Fatal("expected non-select custom field options to be an empty slice")
+	}
 
 	selectField, err := database.CreateCustomField(CustomField{
 		Key:       "environment",
@@ -493,6 +496,12 @@ func TestCustomFieldSchemaCRUDAndValidation(t *testing.T) {
 	}
 	if len(fields) != 2 {
 		t.Fatalf("expected 2 enabled fields, got %d", len(fields))
+	}
+	if fields[0].Key == "owner_email" && fields[0].Options == nil {
+		t.Fatal("expected listed non-select custom field options to be an empty slice")
+	}
+	if fields[1].Key == "owner_email" && fields[1].Options == nil {
+		t.Fatal("expected listed non-select custom field options to be an empty slice")
 	}
 
 	if _, err := ValidateMetadataWithCustomFields(map[string]string{

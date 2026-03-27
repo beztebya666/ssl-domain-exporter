@@ -621,7 +621,7 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
                           onChange={e => setMetadataFilters(current => updateFilter(current, field.key, e.target.value))}
                         >
                           <option value="">All</option>
-                          {field.options.map(option => (
+                          {(field.options ?? []).map(option => (
                             <option key={`${field.key}-${option.value}`} value={option.value}>{option.label}</option>
                           ))}
                         </select>

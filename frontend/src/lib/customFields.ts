@@ -1,7 +1,18 @@
 import type { CustomField } from '../types'
 
+export function normalizeCustomField(field: CustomField): CustomField {
+  return {
+    ...field,
+    options: field.options ?? [],
+  }
+}
+
+export function normalizeCustomFields(fields: CustomField[] | undefined): CustomField[] {
+  return (fields ?? []).map(normalizeCustomField)
+}
+
 export function enabledCustomFields(fields: CustomField[] | undefined): CustomField[] {
-  return (fields ?? []).filter(field => field.enabled).sort((a, b) => a.sort_order - b.sort_order || a.label.localeCompare(b.label))
+  return normalizeCustomFields(fields).filter(field => field.enabled).sort((a, b) => a.sort_order - b.sort_order || a.label.localeCompare(b.label))
 }
 
 export function visibleCustomFields(fields: CustomField[] | undefined, visibility: 'table' | 'details' | 'export'): CustomField[] {

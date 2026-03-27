@@ -69,7 +69,7 @@ function renderFieldInput(field: CustomField, value: string, onChange: (value: s
       return (
         <select {...common} className="select">
           <option value="">Select {field.label}</option>
-          {field.options.map(option => (
+          {(field.options ?? []).map(option => (
             <option key={`${field.key}-${option.value}`} value={option.value}>
               {option.label}
             </option>
