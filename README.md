@@ -299,6 +299,9 @@ docker run --name ssl-domain-exporter \
   ssl-domain-exporter
 ```
 
+If you prefer to pull the image and not use the one you builded, then change it from:   
+```ssl-domain-exporter``` to ```beztebya666/ssl-domain-exporter``` from dockerhub / ghcr
+
 Health check:
 
 ```bash
