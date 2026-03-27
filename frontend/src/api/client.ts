@@ -25,6 +25,7 @@ import type {
   UserAccount,
   UserWritePayload,
 } from '../types'
+import { normalizeCustomField, normalizeCustomFields } from '../lib/customFields'
 
 const api = axios.create({
   baseURL: '/api',
@@ -150,13 +151,13 @@ export const fetchTags = (): Promise<string[]> =>
   api.get('/tags').then(r => r.data)
 
 export const fetchCustomFields = (includeDisabled = false): Promise<CustomField[]> =>
-  api.get('/custom-fields', { params: includeDisabled ? { include_disabled: true } : undefined }).then(r => r.data)
+  api.get('/custom-fields', { params: includeDisabled ? { include_disabled: true } : undefined }).then(r => normalizeCustomFields(r.data))
 
 export const createCustomField = (data: CustomFieldWritePayload): Promise<CustomField> =>
-  api.post('/custom-fields', data).then(r => r.data)
+  api.post('/custom-fields', data).then(r => normalizeCustomField(r.data))
 
 export const updateCustomField = (id: number, data: CustomFieldWritePayload): Promise<CustomField> =>
-  api.put(`/custom-fields/${id}`, data).then(r => r.data)
+  api.put(`/custom-fields/${id}`, data).then(r => normalizeCustomField(r.data))
 
 export const deleteCustomField = (id: number): Promise<void> =>
   api.delete(`/custom-fields/${id}`).then(() => undefined)

@@ -107,7 +107,7 @@ export default function CustomFieldManager() {
       visible_in_export: field.visible_in_export,
       filterable: field.filterable,
       enabled: field.enabled,
-      options: field.options.map(option => ({
+      options: (field.options ?? []).map(option => ({
         value: option.value,
         label: option.label,
         sort_order: option.sort_order,
@@ -188,9 +188,9 @@ export default function CustomFieldManager() {
                     {field.placeholder && <span> | Placeholder: {field.placeholder}</span>}
                     {field.help_text && <span> | {field.help_text}</span>}
                   </div>
-                  {field.options.length > 0 && (
+                  {(field.options ?? []).length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-2">
-                      {field.options.map(option => (
+                      {(field.options ?? []).map(option => (
                         <span key={`${field.key}-${option.value}`} className="rounded-full border border-slate-700 bg-slate-950/50 px-2 py-0.5 text-[11px] text-slate-300">
                           {option.label}
                         </span>
