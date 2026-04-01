@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { LucideIcon } from 'lucide-react'
-import { Save, Activity, Bell, Clock, Shield, Lock, SlidersHorizontal, Globe, Users } from 'lucide-react'
-import { createBackup, createUser, deleteUserAccount, fetchAuditLogs, fetchBackupFiles, fetchConfig, fetchHealth, fetchNotificationStatus, fetchReady, fetchUsers, pruneChecks, testNotifications, updateConfig, updateUserAccount } from '../api/client'
-import type { AppConfig, AuditLog, AuthMe, BackupFile, NotificationChannel, NotificationTestRequest, NotificationTestResult, UserAccount, UserWritePayload } from '../types'
+import { Save, Activity, Bell, Clock, Shield, Lock, SlidersHorizontal, Globe, Users, Server } from 'lucide-react'
+import { createBackup, createUser, deleteUserAccount, fetchAuditLogs, fetchBackupFiles, fetchConfig, fetchF5Certificates, fetchHealth, fetchK8SCertificates, fetchNotificationStatus, fetchReady, fetchUsers, pruneChecks, testNotifications, testSyslog, updateConfig, updateUserAccount } from '../api/client'
+import type { AppConfig, AuditLog, AuthMe, BackupFile, DomainWritePayload, F5ScanResult, K8SScanResult, NotificationChannel, NotificationTestRequest, NotificationTestResult, SyslogTestResult, UserAccount, UserWritePayload } from '../types'
+import AddDomainModal from '../components/AddDomainModal'
 import CollapsiblePanel from '../components/CollapsiblePanel'
 import CustomFieldManager from '../components/CustomFieldManager'
 import NotificationSetupWizard from '../components/NotificationSetupWizard'
 import SecretInput from '../components/SecretInput'
 import { ListCardSkeleton, PageHeadingSkeleton, TableSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/ToastProvider'
+import { formatSourceDisplayName } from '../lib/domainSources'
 import { getErrorMessage } from '../lib/utils'
 import { UI_BUILD_ID, UI_VERSION } from '../version'
 
@@ -119,6 +121,11 @@ function normalizeConfigArrays(config: AppConfig): AppConfig {
     server: {
       ...config.server,
       allowed_origins: config.server.allowed_origins ?? [],
+      tls: {
+        enabled: config.server.tls?.enabled ?? false,
+        cert_file: config.server.tls?.cert_file ?? '',
+        key_file: config.server.tls?.key_file ?? '',
+      },
     },
     notifications: {
       ...config.notifications,
@@ -126,6 +133,34 @@ function normalizeConfigArrays(config: AppConfig): AppConfig {
         ...config.notifications.email,
         to: config.notifications.email.to ?? [],
       },
+    },
+    logging: {
+      ...config.logging,
+      syslog: {
+        enabled: config.logging.syslog?.enabled ?? false,
+        network: config.logging.syslog?.network === 'tcp' ? 'tcp' : 'udp',
+        address: config.logging.syslog?.address ?? '',
+        tag: config.logging.syslog?.tag ?? 'ssl-domain-exporter',
+        facility: config.logging.syslog?.facility ?? 'local0',
+      },
+    },
+    kubernetes: {
+      enabled: config.kubernetes?.enabled ?? false,
+      api_server: config.kubernetes?.api_server ?? '',
+      token: config.kubernetes?.token ?? '',
+      token_file: config.kubernetes?.token_file ?? '',
+      namespace: config.kubernetes?.namespace ?? '',
+      label_selector: config.kubernetes?.label_selector ?? '',
+      insecure_skip_verify: config.kubernetes?.insecure_skip_verify ?? false,
+      ca_cert_file: config.kubernetes?.ca_cert_file ?? '',
+    },
+    f5: {
+      enabled: config.f5?.enabled ?? false,
+      host: config.f5?.host ?? '',
+      username: config.f5?.username ?? '',
+      password: config.f5?.password ?? '',
+      insecure_skip_verify: config.f5?.insecure_skip_verify ?? false,
+      partition: config.f5?.partition ?? '',
     },
     dns: {
       ...config.dns,
@@ -156,7 +191,12 @@ export default function SettingsPage({ me }: SettingsPageProps) {
   const [newUser, setNewUser] = useState<UserWritePayload>({ username: '', role: 'viewer', enabled: true, password: '' })
   const [editableUsers, setEditableUsers] = useState<EditableUser[]>([])
   const [notificationTestResults, setNotificationTestResults] = useState<NotificationTestResult[]>([])
+  const [syslogTestResult, setSyslogTestResult] = useState<SyslogTestResult | null>(null)
+  const [k8sScanResult, setK8sScanResult] = useState<K8SScanResult | null>(null)
+  const [f5ScanResult, setF5ScanResult] = useState<F5ScanResult | null>(null)
+  const [inventoryDraft, setInventoryDraft] = useState<Partial<DomainWritePayload> | null>(null)
   const [pruneDays, setPruneDays] = useState(30)
+  const canEdit = me?.can_edit ?? false
 
   useEffect(() => {
     if (data) {
@@ -227,6 +267,34 @@ export default function SettingsPage({ me }: SettingsPageProps) {
     },
     onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to send test notifications.') }),
   })
+  const syslogTestMutation = useMutation({
+    mutationFn: (payload: AppConfig['logging']['syslog']) => testSyslog(payload),
+    onSuccess: (result) => {
+      setSyslogTestResult(result)
+      showToast({ tone: 'success', text: result.message || 'Test syslog message sent successfully.' })
+    },
+    onError: (err: unknown) => {
+      const message = getErrorMessage(err, 'Failed to send syslog test message.')
+      setSyslogTestResult({ success: false, error: message })
+      showToast({ tone: 'error', text: message })
+    },
+  })
+  const k8sScanMutation = useMutation({
+    mutationFn: fetchK8SCertificates,
+    onSuccess: (result) => {
+      setK8sScanResult(result)
+      showToast({ tone: 'success', text: `Kubernetes scan completed. ${result.total} certificate entries inspected.` })
+    },
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to scan Kubernetes TLS secrets.') }),
+  })
+  const f5ScanMutation = useMutation({
+    mutationFn: fetchF5Certificates,
+    onSuccess: (result) => {
+      setF5ScanResult(result)
+      showToast({ tone: 'success', text: `F5 scan completed. ${result.total} certificates inspected.` })
+    },
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to scan F5 certificates.') }),
+  })
   const backupMutation = useMutation({
     mutationFn: createBackup,
     onSuccess: (file) => {
@@ -273,6 +341,13 @@ export default function SettingsPage({ me }: SettingsPageProps) {
 
   return (
     <div className="p-6 space-y-5 max-w-6xl">
+      {inventoryDraft && canEdit && (
+        <AddDomainModal
+          initialDraft={inventoryDraft}
+          onClose={() => setInventoryDraft(null)}
+        />
+      )}
+
       <div className="flex items-center justify-between flex-wrap gap-4">
         <div>
           <h1 className="text-xl font-bold text-white">Administration</h1>
@@ -448,6 +523,40 @@ export default function SettingsPage({ me }: SettingsPageProps) {
         />
       </Section>
 
+      <Section title="Server & Native TLS" icon={Shield}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="Server host" hint="Bind address used by the embedded HTTP server" restart>
+            <input className="input" value={form.server.host}
+              onChange={e => setForm(f => f ? ({ ...f, server: { ...f.server, host: e.target.value } }) : f)} />
+          </Field>
+          <Field label="Server port" hint="Listener port for the embedded UI and API" restart>
+            <input className="input" value={form.server.port}
+              onChange={e => setForm(f => f ? ({ ...f, server: { ...f.server, port: e.target.value } }) : f)} />
+          </Field>
+          <Field label="Allowed UI origins" hint="Comma-separated origins for split UI/API deployments. Empty keeps CORS same-origin only.">
+            <input className="input" value={(form.server.allowed_origins ?? []).join(', ')}
+              onChange={e => setForm(f => f ? ({ ...f, server: { ...f.server, allowed_origins: e.target.value.split(',').map(s => s.trim()).filter(Boolean) } }) : f)} />
+          </Field>
+          <Field label="Native TLS enabled" hint="Serve HTTPS directly from the application process" restart>
+            <BoolSelect value={form.server.tls.enabled}
+              onChange={v => setForm(f => f ? ({ ...f, server: { ...f.server, tls: { ...f.server.tls, enabled: v } } }) : f)} />
+          </Field>
+          <Field label="TLS certificate file" hint="PEM certificate chain path used for HTTPS" restart>
+            <input className="input" value={form.server.tls.cert_file}
+              onChange={e => setForm(f => f ? ({ ...f, server: { ...f.server, tls: { ...f.server.tls, cert_file: e.target.value } } }) : f)}
+              placeholder="/app/certs/tls.crt" />
+          </Field>
+          <Field label="TLS private key file" hint="PEM private key path used for HTTPS" restart>
+            <input className="input" value={form.server.tls.key_file}
+              onChange={e => setForm(f => f ? ({ ...f, server: { ...f.server, tls: { ...f.server.tls, key_file: e.target.value } } }) : f)}
+              placeholder="/app/certs/tls.key" />
+          </Field>
+        </div>
+        <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-xs text-slate-400">
+          Native TLS settings are persisted immediately but only take effect after the service restarts. Keep <code>auth.cookie_secure</code> enabled when serving the UI exclusively over HTTPS.
+        </div>
+      </Section>
+
       <Section title="Access & Public UI" icon={Lock}>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <Field label="Auth enabled"><BoolSelect value={form.auth.enabled}
@@ -531,10 +640,6 @@ export default function SettingsPage({ me }: SettingsPageProps) {
             <input className="input" value={form.security.admin_window}
               onChange={e => setForm(f => f ? ({ ...f, security: { ...f.security, admin_window: e.target.value } }) : f)} />
           </Field>
-          <Field label="Allowed UI origins" hint="Comma-separated origins for split UI/API deployments. Empty keeps CORS same-origin only.">
-            <input className="input" value={(form.server.allowed_origins ?? []).join(', ')}
-              onChange={e => setForm(f => f ? ({ ...f, server: { ...f.server, allowed_origins: e.target.value.split(',').map(s => s.trim()).filter(Boolean) } }) : f)} />
-          </Field>
         </div>
       </Section>
 
@@ -600,6 +705,168 @@ export default function SettingsPage({ me }: SettingsPageProps) {
           <Field label="JSON logs" restart><BoolSelect value={form.logging.json}
             onChange={v => setForm(f => f ? ({ ...f, logging: { ...f.logging, json: v } }) : f)} /></Field>
         </div>
+      </Section>
+
+      <Section title="Syslog Forwarding" icon={Activity}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="Syslog enabled" hint="Forward application logs to a central collector" restart>
+            <BoolSelect value={form.logging.syslog.enabled}
+              onChange={v => setForm(f => f ? ({ ...f, logging: { ...f.logging, syslog: { ...f.logging.syslog, enabled: v } } }) : f)} />
+          </Field>
+          <Field label="Network" hint="UDP is default; use TCP for reliable delivery" restart>
+            <select className="select" value={form.logging.syslog.network}
+              onChange={e => setForm(f => f ? ({ ...f, logging: { ...f.logging, syslog: { ...f.logging.syslog, network: e.target.value as 'tcp' | 'udp' } } }) : f)}>
+              <option value="udp">udp</option>
+              <option value="tcp">tcp</option>
+            </select>
+          </Field>
+          <Field label="Address" hint="Remote syslog collector in host:port form" restart>
+            <input className="input" value={form.logging.syslog.address}
+              onChange={e => setForm(f => f ? ({ ...f, logging: { ...f.logging, syslog: { ...f.logging.syslog, address: e.target.value } } }) : f)}
+              placeholder="syslog.example.com:514" />
+          </Field>
+          <Field label="Tag" hint="App label attached to outgoing syslog messages" restart>
+            <input className="input" value={form.logging.syslog.tag}
+              onChange={e => setForm(f => f ? ({ ...f, logging: { ...f.logging, syslog: { ...f.logging.syslog, tag: e.target.value } } }) : f)} />
+          </Field>
+          <Field label="Facility" hint="Facility code used by the central syslog collector" restart>
+            <input className="input" value={form.logging.syslog.facility}
+              onChange={e => setForm(f => f ? ({ ...f, logging: { ...f.logging, syslog: { ...f.logging.syslog, facility: e.target.value } } }) : f)}
+              placeholder="local0" />
+          </Field>
+          <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-xs text-slate-400">
+            Test delivery uses the values currently visible in this form, even before you save them. Runtime log forwarding switches over after the next restart.
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            className="btn-primary"
+            onClick={() => syslogTestMutation.mutate(form.logging.syslog)}
+            disabled={syslogTestMutation.isPending || !form.logging.syslog.enabled}
+          >
+            {syslogTestMutation.isPending ? 'Sending test...' : 'Send syslog test'}
+          </button>
+          {syslogTestResult && (
+            <div className={`rounded-full px-3 py-1 text-xs ${syslogTestResult.success ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'}`}>
+              {syslogTestResult.success ? (syslogTestResult.message || 'Test message delivered.') : syslogTestResult.error || 'Syslog test failed.'}
+            </div>
+          )}
+        </div>
+      </Section>
+
+      <Section title="Kubernetes TLS Secret Scanning" icon={Globe}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="Enabled" hint="Turns on Kubernetes TLS secret scanning support">
+            <BoolSelect value={form.kubernetes.enabled}
+              onChange={v => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, enabled: v } }) : f)} />
+          </Field>
+          <Field label="API server" hint="Leave blank for the in-cluster default service">
+            <input className="input" value={form.kubernetes.api_server}
+              onChange={e => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, api_server: e.target.value } }) : f)}
+              placeholder="https://kubernetes.default.svc" />
+          </Field>
+          <Field label="Namespace" hint="Blank scans all namespaces visible to the service account">
+            <input className="input" value={form.kubernetes.namespace}
+              onChange={e => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, namespace: e.target.value } }) : f)}
+              placeholder="production" />
+          </Field>
+          <Field label="Label selector" hint="Optional Kubernetes label selector used to scope secrets">
+            <input className="input" value={form.kubernetes.label_selector}
+              onChange={e => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, label_selector: e.target.value } }) : f)}
+              placeholder="app=ingress-nginx" />
+          </Field>
+          <Field label="Bearer token">
+            <SecretInput
+              value={form.kubernetes.token}
+              ariaLabel="Kubernetes bearer token"
+              onChange={value => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, token: value } }) : f)}
+            />
+          </Field>
+          <Field label="Token file" hint="Preferred when the token is mounted as a secret file">
+            <input className="input" value={form.kubernetes.token_file}
+              onChange={e => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, token_file: e.target.value } }) : f)}
+              placeholder="/var/run/secrets/kubernetes.io/serviceaccount/token" />
+          </Field>
+          <Field label="CA certificate file" hint="Optional PEM bundle for Kubernetes API TLS verification">
+            <input className="input" value={form.kubernetes.ca_cert_file}
+              onChange={e => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, ca_cert_file: e.target.value } }) : f)}
+              placeholder="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" />
+          </Field>
+          <Field label="Skip TLS verification" hint="Use only when your cluster API presents an untrusted certificate">
+            <BoolSelect value={form.kubernetes.insecure_skip_verify}
+              onChange={v => setForm(f => f ? ({ ...f, kubernetes: { ...f.kubernetes, insecure_skip_verify: v } }) : f)} />
+          </Field>
+          <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-xs text-slate-400">
+            The scan action below uses the currently saved configuration. Save settings first when you change the connection, token, or namespace scope.
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button className="btn-primary" onClick={() => k8sScanMutation.mutate()} disabled={k8sScanMutation.isPending || !form.kubernetes.enabled}>
+            {k8sScanMutation.isPending ? 'Scanning...' : 'Run Kubernetes scan'}
+          </button>
+          <span className="text-xs text-slate-500">Fetches TLS secrets and parses every certificate in <code>tls.crt</code>.</span>
+        </div>
+
+        {k8sScanResult && (
+          <K8SScanResults
+            result={k8sScanResult}
+            warningDays={form.alerts.ssl_expiry_warning_days}
+            canTrack={canEdit}
+            onTrackCertificate={(draft) => setInventoryDraft(draft)}
+          />
+        )}
+      </Section>
+
+      <Section title="F5 BIG-IP Certificate Scanning" icon={Server}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Field label="Enabled" hint="Turns on F5 BIG-IP certificate inventory scanning">
+            <BoolSelect value={form.f5.enabled}
+              onChange={v => setForm(f => f ? ({ ...f, f5: { ...f.f5, enabled: v } }) : f)} />
+          </Field>
+          <Field label="F5 host" hint="BIG-IP management endpoint, with or without https://">
+            <input className="input" value={form.f5.host}
+              onChange={e => setForm(f => f ? ({ ...f, f5: { ...f.f5, host: e.target.value } }) : f)}
+              placeholder="https://bigip.example.com" />
+          </Field>
+          <Field label="Partition" hint="Optional BIG-IP partition filter">
+            <input className="input" value={form.f5.partition}
+              onChange={e => setForm(f => f ? ({ ...f, f5: { ...f.f5, partition: e.target.value } }) : f)}
+              placeholder="Common" />
+          </Field>
+          <Field label="Username">
+            <input className="input" value={form.f5.username}
+              onChange={e => setForm(f => f ? ({ ...f, f5: { ...f.f5, username: e.target.value } }) : f)} />
+          </Field>
+          <Field label="Password">
+            <SecretInput
+              value={form.f5.password}
+              ariaLabel="F5 password"
+              onChange={value => setForm(f => f ? ({ ...f, f5: { ...f.f5, password: value } }) : f)}
+            />
+          </Field>
+          <Field label="Skip TLS verification" hint="Use only for labs or appliances with a private admin certificate">
+            <BoolSelect value={form.f5.insecure_skip_verify}
+              onChange={v => setForm(f => f ? ({ ...f, f5: { ...f.f5, insecure_skip_verify: v } }) : f)} />
+          </Field>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button className="btn-primary" onClick={() => f5ScanMutation.mutate()} disabled={f5ScanMutation.isPending || !form.f5.enabled}>
+            {f5ScanMutation.isPending ? 'Scanning...' : 'Run F5 scan'}
+          </button>
+          <span className="text-xs text-slate-500">Uses the saved BIG-IP credentials and optional partition filter to query <code>/mgmt/tm/sys/file/ssl-cert</code>.</span>
+        </div>
+
+        {f5ScanResult && (
+          <F5ScanResults
+            result={f5ScanResult}
+            warningDays={form.alerts.ssl_expiry_warning_days}
+            canTrack={canEdit}
+            onTrackCertificate={(draft) => setInventoryDraft(draft)}
+          />
+        )}
       </Section>
 
       <Section title="Maintenance & Health" icon={Activity}>
@@ -853,4 +1120,254 @@ function wouldLeaveNoEnabledAdmins(users: UserAccount[], draft: EditableUser): b
     return effective.enabled && effective.role === 'admin'
   }).length
   return resultingAdmins === 0
+}
+
+function K8SScanResults({
+  result,
+  warningDays,
+  canTrack,
+  onTrackCertificate,
+}: {
+  result: K8SScanResult
+  warningDays: number
+  canTrack: boolean
+  onTrackCertificate: (draft: Partial<DomainWritePayload>) => void
+}) {
+  return (
+    <div className="space-y-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+      <ScanSummary
+        total={result.total}
+        healthy={result.healthy}
+        warning={result.warning}
+        expired={result.expired}
+        errors={result.errors}
+        scannedAt={result.scanned_at}
+        error={result.error}
+      />
+      {result.certificates.length === 0 ? (
+        <div className="text-sm text-slate-400">No Kubernetes certificates found in the current scan scope.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-slate-950/70 text-slate-400">
+              <tr>
+                <th className="px-4 py-3 font-medium">Secret</th>
+                <th className="px-4 py-3 font-medium">Subject</th>
+                <th className="px-4 py-3 font-medium">Issuer</th>
+                <th className="px-4 py-3 font-medium">Expiry</th>
+                <th className="px-4 py-3 font-medium">Serial</th>
+                <th className="px-4 py-3 font-medium">Status</th>
+                {canTrack && <th className="px-4 py-3 font-medium text-right">Inventory</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {result.certificates.map((cert, index) => (
+                <tr key={`${cert.namespace}-${cert.secret_name}-${cert.serial || index}`} className="border-t border-slate-800 text-slate-300">
+                  <td className="px-4 py-3 align-top">
+                    <div className="font-medium text-white">{cert.secret_name || 'unknown secret'}</div>
+                    <div className="text-xs text-slate-500">{cert.namespace || 'cluster-wide'} | {cert.type || 'unknown type'}</div>
+                  </td>
+                  <td className="px-4 py-3 align-top">
+                    <div>{cert.subject || '-'}</div>
+                    {cert.dns_names && cert.dns_names.length > 0 && (
+                      <div className="mt-1 text-xs text-slate-500">{cert.dns_names.join(', ')}</div>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 align-top">{cert.issuer || '-'}</td>
+                  <td className="px-4 py-3 align-top">
+                    <div className={expiryDaysClass(cert.expiry_days, cert.is_expired, Boolean(cert.error), warningDays)}>
+                      {cert.error ? '-' : formatCertificateExpiry(cert.not_after, cert.expiry_days, cert.is_expired)}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 align-top text-xs text-slate-500">{cert.serial || '-'}</td>
+                  <td className="px-4 py-3 align-top">
+                    {cert.error ? (
+                      <span className="text-rose-300">{cert.error}</span>
+                    ) : cert.is_expired ? (
+                      <span className="text-rose-300">expired</span>
+                    ) : cert.expiry_days <= warningDays ? (
+                      <span className="text-amber-300">warning</span>
+                    ) : (
+                        <span className="text-emerald-300">healthy</span>
+                    )}
+                  </td>
+                  {canTrack && (
+                    <td className="px-4 py-3 align-top text-right">
+                      <button
+                        type="button"
+                        className="btn-ghost border border-slate-700 text-xs"
+                        disabled={Boolean(cert.error) || !cert.namespace || !cert.secret_name}
+                        onClick={() => onTrackCertificate({
+                          name: formatSourceDisplayName('kubernetes_secret', {
+                            namespace: cert.namespace,
+                            secret_name: cert.secret_name,
+                          }),
+                          source_type: 'kubernetes_secret',
+                          source_ref: {
+                            namespace: cert.namespace,
+                            secret_name: cert.secret_name,
+                            ...(cert.serial ? { certificate_serial: cert.serial } : {}),
+                          },
+                        })}
+                      >
+                        Track
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function F5ScanResults({
+  result,
+  warningDays,
+  canTrack,
+  onTrackCertificate,
+}: {
+  result: F5ScanResult
+  warningDays: number
+  canTrack: boolean
+  onTrackCertificate: (draft: Partial<DomainWritePayload>) => void
+}) {
+  return (
+    <div className="space-y-4 rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+      <ScanSummary
+        total={result.total}
+        healthy={result.healthy}
+        warning={result.warning}
+        expired={result.expired}
+        errors={result.errors}
+        scannedAt={result.scanned_at}
+        error={result.error}
+      />
+      {result.certificates.length === 0 ? (
+        <div className="text-sm text-slate-400">No F5 certificates found for the current connection and partition filter.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-slate-950/70 text-slate-400">
+              <tr>
+                <th className="px-4 py-3 font-medium">Name</th>
+                <th className="px-4 py-3 font-medium">Partition</th>
+                <th className="px-4 py-3 font-medium">Subject</th>
+                <th className="px-4 py-3 font-medium">Issuer</th>
+                <th className="px-4 py-3 font-medium">Expiry</th>
+                <th className="px-4 py-3 font-medium">Key Type</th>
+                {canTrack && <th className="px-4 py-3 font-medium text-right">Inventory</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {result.certificates.map((cert, index) => (
+                <tr key={`${cert.partition}-${cert.name}-${cert.serial || index}`} className="border-t border-slate-800 text-slate-300">
+                  <td className="px-4 py-3 align-top font-medium text-white">{cert.name || 'unknown'}</td>
+                  <td className="px-4 py-3 align-top text-slate-500">{cert.partition || '-'}</td>
+                  <td className="px-4 py-3 align-top">{cert.subject || '-'}</td>
+                  <td className="px-4 py-3 align-top">{cert.issuer || '-'}</td>
+                  <td className="px-4 py-3 align-top">
+                    <div className={expiryDaysClass(cert.expiry_days, cert.is_expired, Boolean(cert.error), warningDays)}>
+                      {cert.error ? '-' : formatCertificateExpiry(cert.not_after, cert.expiry_days, cert.is_expired)}
+                    </div>
+                    {cert.error && <div className="mt-1 text-xs text-rose-300">{cert.error}</div>}
+                  </td>
+                  <td className="px-4 py-3 align-top text-slate-500">{cert.key_type || '-'}</td>
+                  {canTrack && (
+                    <td className="px-4 py-3 align-top text-right">
+                      <button
+                        type="button"
+                        className="btn-ghost border border-slate-700 text-xs"
+                        disabled={Boolean(cert.error) || !cert.partition || !cert.name}
+                        onClick={() => onTrackCertificate({
+                          name: formatSourceDisplayName('f5_certificate', {
+                            partition: cert.partition,
+                            certificate_name: cert.name,
+                          }),
+                          source_type: 'f5_certificate',
+                          source_ref: {
+                            partition: cert.partition,
+                            certificate_name: cert.name,
+                            ...(cert.serial ? { serial: cert.serial } : {}),
+                          },
+                        })}
+                      >
+                        Track
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ScanSummary({
+  total,
+  healthy,
+  warning,
+  expired,
+  errors,
+  scannedAt,
+  error,
+}: {
+  total: number
+  healthy: number
+  warning: number
+  expired: number
+  errors: number
+  scannedAt: string
+  error?: string
+}) {
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+        <MetricPill label="Total" value={total} tone="neutral" />
+        <MetricPill label="Healthy" value={healthy} tone="success" />
+        <MetricPill label="Warning" value={warning} tone="warning" />
+        <MetricPill label="Expired" value={expired} tone="danger" />
+        <MetricPill label="Errors" value={errors} tone="danger" />
+      </div>
+      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
+        <span>Scanned at {new Date(scannedAt).toLocaleString()}</span>
+        {error && <span className="text-rose-300">{error}</span>}
+      </div>
+    </div>
+  )
+}
+
+function MetricPill({ label, value, tone }: { label: string; value: number; tone: 'neutral' | 'success' | 'warning' | 'danger' }) {
+  const toneClass = {
+    neutral: 'border-slate-700 bg-slate-900/50 text-slate-200',
+    success: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200',
+    warning: 'border-amber-500/20 bg-amber-500/10 text-amber-200',
+    danger: 'border-rose-500/20 bg-rose-500/10 text-rose-200',
+  }[tone]
+
+  return (
+    <div className={`rounded-xl border px-4 py-3 ${toneClass}`}>
+      <div className="text-[11px] uppercase tracking-wide">{label}</div>
+      <div className="mt-1 text-lg font-semibold text-white">{value}</div>
+    </div>
+  )
+}
+
+function formatCertificateExpiry(value: string, days: number, expired: boolean): string {
+  if (!value) {
+    return `${days}d`
+  }
+  return `${new Date(value).toLocaleDateString()} | ${expired ? 'expired' : `${days}d`}`
+}
+
+function expiryDaysClass(days: number, expired: boolean, hasError: boolean, warningDays = 14): string {
+  if (hasError || expired) return 'text-rose-300'
+  if (days <= warningDays) return 'text-amber-300'
+  return 'text-emerald-300'
 }

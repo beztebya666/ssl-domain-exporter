@@ -83,6 +83,7 @@ func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched 
 		editor.PUT("/domains/:id", h.UpdateDomain)
 		editor.DELETE("/domains/:id", h.DeleteDomain)
 		editor.POST("/domains/:id/check", h.TriggerCheck)
+		editor.POST("/domains/:id/notify", h.SendAdHocNotification)
 
 		editor.POST("/folders", h.CreateFolder)
 		editor.PUT("/folders/:id", h.UpdateFolder)
@@ -104,6 +105,9 @@ func NewRouter(cfg *config.Config, database *db.DB, chk *checker.Checker, sched 
 		admin.DELETE("/custom-fields/:id", h.DeleteCustomField)
 		admin.GET("/notifications/status", h.GetNotificationStatus)
 		admin.POST("/notifications/test", h.TestNotifications)
+		admin.POST("/syslog/test", h.TestSyslog)
+		admin.GET("/k8s/certificates", h.ScanK8SCertificates)
+		admin.GET("/f5/certificates", h.ScanF5Certificates)
 		admin.GET("/settings", h.GetSettings)
 		admin.PUT("/settings", h.UpdateSettings)
 		admin.GET("/users", h.ListUsers)

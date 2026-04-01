@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import { Clock3, FileJson, FolderPlus, ListChecks, Plus, Server, Settings2, Shield, Upload } from 'lucide-react'
 import { createDomain, fetchFolders, createFolder, fetchBootstrap, fetchCustomFields, importDomains } from '../api/client'
-import type { DomainImportRequest, DomainImportResponse } from '../types'
+import type { DomainImportRequest, DomainImportResponse, DomainWritePayload } from '../types'
 import TagEditor from './TagEditor'
 import MetadataEditor from './MetadataEditor'
 import { normalizeMetadata } from '../lib/domainFields'
@@ -11,9 +11,12 @@ import { mergeSchemaAndExtraMetadata, splitMetadataBySchema } from '../lib/custo
 import CustomFieldInputs from './CustomFieldInputs'
 import CollapsiblePanel from './CollapsiblePanel'
 import ModalShell from './ModalShell'
+import InventorySourceEditor from './InventorySourceEditor'
+import { buildSourceWritePayload, createInventorySourceDraft } from '../lib/domainSources'
 
 interface Props {
   onClose: () => void
+  initialDraft?: Partial<DomainWritePayload> | null
 }
 
 type Mode = 'single' | 'lines' | 'json'
@@ -26,9 +29,9 @@ const INTERVALS = [
   { label: '24 hours', value: 86400 },
 ]
 
-export default function AddDomainModal({ onClose }: Props) {
+export default function AddDomainModal({ onClose, initialDraft }: Props) {
   const [mode, setMode] = useState<Mode>('single')
-  const [name, setName] = useState('')
+  const [sourceDraft, setSourceDraft] = useState(() => createInventorySourceDraft(initialDraft))
   const [tags, setTags] = useState<string[]>([])
   const [metadata, setMetadata] = useState<Record<string, string>>({})
   const [enabled, setEnabled] = useState(true)
@@ -103,22 +106,33 @@ export default function AddDomainModal({ onClose }: Props) {
 
   const handleSingle = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!name.trim()) return
     setSubmitError('')
     setLastImport(null)
 
     try {
+      const sourcePayload = buildSourceWritePayload(sourceDraft)
+      if (sourcePayload.source_type === 'manual' && !sourcePayload.name?.trim()) {
+        setSubmitError('Domain / host is required for manual endpoints.')
+        return
+      }
+
       await mutation.mutateAsync({
-        name: name.trim(),
+        name: sourcePayload.name,
+        source_type: sourcePayload.source_type,
+        source_ref: sourcePayload.source_ref,
         tags,
         metadata: normalizeMetadata(metadata),
         enabled,
         check_interval: interval,
-        port,
         folder_id: selectedFolderID,
-        custom_ca_pem: customCAPEM.trim() || undefined,
-        check_mode: effectiveMode,
-        dns_servers: dnsServers.trim() || undefined,
+        ...(sourcePayload.source_type === 'manual'
+          ? {
+              port,
+              custom_ca_pem: customCAPEM.trim() || undefined,
+              check_mode: effectiveMode,
+              dns_servers: dnsServers.trim() || undefined,
+            }
+          : {}),
       })
       onClose()
     } catch (err) {
@@ -208,6 +222,7 @@ export default function AddDomainModal({ onClose }: Props) {
 
   const isImportMode = mode !== 'single'
   const isBusy = mutation.isPending || importMutation.isPending
+  const singleModeUsesManualEndpoint = sourceDraft.sourceType === 'manual'
 
   return (
     <ModalShell
@@ -243,7 +258,7 @@ export default function AddDomainModal({ onClose }: Props) {
             <CollapsiblePanel
               title={mode === 'single' ? 'Single domain source' : mode === 'lines' ? 'Line import source' : 'JSON import source'}
               description={mode === 'single'
-                ? 'Create one monitored endpoint with shared enterprise defaults.'
+                ? 'Create one monitored inventory item from a manual endpoint, Kubernetes TLS secret, or F5 certificate.'
                 : mode === 'lines'
                   ? 'Import a plain list of domains while applying the defaults below.'
                   : 'Import structured records with metadata, tags, and custom inventory fields.'}
@@ -251,18 +266,7 @@ export default function AddDomainModal({ onClose }: Props) {
               defaultOpen
             >
               {mode === 'single' && (
-                <div>
-                  <label className="label" htmlFor="single-domain-name">Domain name</label>
-                  <input
-                    id="single-domain-name"
-                    className="input"
-                    placeholder="example.com"
-                    value={name}
-                    onChange={e => setName(e.target.value)}
-                    required
-                  />
-                  <p className="mt-1 text-xs text-gray-500">`https://` or path parts are removed automatically.</p>
-                </div>
+                <InventorySourceEditor draft={sourceDraft} onChange={setSourceDraft} />
               )}
 
               {mode === 'lines' && (
@@ -291,7 +295,7 @@ export default function AddDomainModal({ onClose }: Props) {
                     onChange={e => setJsonText(e.target.value)}
                     required
                   />
-                  <p className="mt-1 text-xs text-gray-500">Supports top-level objects with a `domains` array or a plain array. Unknown item fields are stored in metadata automatically.</p>
+                  <p className="mt-1 text-xs text-gray-500">Supports top-level objects with a `domains` array or a plain array. Unknown item fields are stored in metadata automatically, and source-backed imports can pass `source_type` plus `source_ref`.</p>
                 </div>
               )}
             </CollapsiblePanel>
@@ -324,7 +328,9 @@ export default function AddDomainModal({ onClose }: Props) {
 
             <CollapsiblePanel
               title="Monitoring defaults"
-              description="Scheduling, endpoint port, folder placement, registration lookup policy, and DNS overrides."
+              description={mode === 'single' && !singleModeUsesManualEndpoint
+                ? 'Scheduling, inventory placement, and enablement for source-backed certificate tracking.'
+                : 'Scheduling, endpoint port, folder placement, registration lookup policy, and DNS overrides.'}
               icon={Clock3}
               defaultOpen
             >
@@ -336,18 +342,6 @@ export default function AddDomainModal({ onClose }: Props) {
                       <option key={item.value} value={item.value}>{item.label}</option>
                     ))}
                   </select>
-                </div>
-
-                <div>
-                  <label className="label">HTTPS Port</label>
-                  <input
-                    className="input"
-                    type="number"
-                    min={1}
-                    max={65535}
-                    value={port}
-                    onChange={e => setPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))}
-                  />
                 </div>
 
                 <div>
@@ -368,27 +362,49 @@ export default function AddDomainModal({ onClose }: Props) {
                   </select>
                 </div>
 
-                <div>
-                  <label className="label">Check mode</label>
-                  <select className="select" value={checkMode} onChange={e => setCheckMode(e.target.value)}>
-                    <option value="">Default ({cfg?.domains.default_check_mode || 'full'})</option>
-                    <option value="full">Full (SSL + Domain Registration)</option>
-                    <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
-                  </select>
-                  <p className="mt-1 text-xs text-gray-500">SSL Only skips domain registration lookup for internal names such as `.local` or `.internal`.</p>
-                </div>
+                {(mode !== 'single' || singleModeUsesManualEndpoint) && (
+                  <>
+                    <div>
+                      <label className="label">HTTPS Port</label>
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={port}
+                        onChange={e => setPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))}
+                      />
+                    </div>
 
-                <div>
-                  <label className="label">DNS Servers</label>
-                  <input
-                    className="input"
-                    placeholder="10.0.0.1:53, 10.0.0.2:53"
-                    value={dnsServers}
-                    onChange={e => setDnsServers(e.target.value)}
-                  />
-                  <p className="mt-1 text-xs text-gray-500">Per-domain DNS servers. Overrides global DNS config.</p>
-                </div>
+                    <div>
+                      <label className="label">Check mode</label>
+                      <select className="select" value={checkMode} onChange={e => setCheckMode(e.target.value)}>
+                        <option value="">Default ({cfg?.domains.default_check_mode || 'full'})</option>
+                        <option value="full">Full (SSL + Domain Registration)</option>
+                        <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
+                      </select>
+                      <p className="mt-1 text-xs text-gray-500">SSL Only skips domain registration lookup for internal names such as `.local` or `.internal`.</p>
+                    </div>
+
+                    <div>
+                      <label className="label">DNS Servers</label>
+                      <input
+                        className="input"
+                        placeholder="10.0.0.1:53, 10.0.0.2:53"
+                        value={dnsServers}
+                        onChange={e => setDnsServers(e.target.value)}
+                      />
+                      <p className="mt-1 text-xs text-gray-500">Per-domain DNS servers. Overrides global DNS config.</p>
+                    </div>
+                  </>
+                )}
               </div>
+
+              {mode === 'single' && !singleModeUsesManualEndpoint && (
+                <div className="mt-4 rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3 text-xs text-slate-400">
+                  Source-backed inventory items do not use manual endpoint settings such as port, DNS override, custom CA, or RDAP/WHOIS check mode.
+                </div>
+              )}
             </CollapsiblePanel>
 
             {isImportMode && (
@@ -444,26 +460,34 @@ export default function AddDomainModal({ onClose }: Props) {
               </div>
 
               <div className="mt-4">
-                <div className="mb-1.5 flex items-center justify-between">
-                  <label className="label mb-0">Custom Root CA (optional)</label>
-                  <label className="inline-flex cursor-pointer items-center gap-1.5 border border-gray-700 px-2 py-1 text-xs btn-ghost">
-                    <Upload size={12} />
-                    Load .crt/.pem
-                    <input
-                      type="file"
-                      accept=".crt,.pem,.cer,text/plain"
-                      className="hidden"
-                      onChange={e => loadCertFile(e.target.files?.[0] ?? null)}
+                {(mode !== 'single' || singleModeUsesManualEndpoint) ? (
+                  <>
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <label className="label mb-0">Custom Root CA (optional)</label>
+                      <label className="inline-flex cursor-pointer items-center gap-1.5 border border-gray-700 px-2 py-1 text-xs btn-ghost">
+                        <Upload size={12} />
+                        Load .crt/.pem
+                        <input
+                          type="file"
+                          accept=".crt,.pem,.cer,text/plain"
+                          className="hidden"
+                          onChange={e => loadCertFile(e.target.files?.[0] ?? null)}
+                        />
+                      </label>
+                    </div>
+                    <textarea
+                      className="input h-36 resize-y font-mono text-xs"
+                      placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+                      value={customCAPEM}
+                      onChange={e => setCustomCAPEM(e.target.value)}
                     />
-                  </label>
-                </div>
-                <textarea
-                  className="input h-36 resize-y font-mono text-xs"
-                  placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
-                  value={customCAPEM}
-                  onChange={e => setCustomCAPEM(e.target.value)}
-                />
-                <p className="mt-1 text-xs text-gray-500">Used as an additional trust root for SSL and HTTPS checks for this domain.</p>
+                    <p className="mt-1 text-xs text-gray-500">Used as an additional trust root for SSL and HTTPS checks for this domain.</p>
+                  </>
+                ) : (
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3 text-xs text-slate-400">
+                    Source-backed inventory items read certificate metadata directly from Kubernetes or F5 and do not consume a per-item custom CA bundle.
+                  </div>
+                )}
               </div>
             </CollapsiblePanel>
 

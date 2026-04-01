@@ -153,3 +153,23 @@ func TestValidateRejectsLiteralRedactedSecrets(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRequiresF5CredentialsWhenEnabled(t *testing.T) {
+	cfg := Default()
+	cfg.F5.Enabled = true
+	cfg.F5.Host = ""
+	cfg.F5.Username = ""
+	cfg.F5.Password = ""
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+
+	message := err.Error()
+	for _, fragment := range []string{"f5.host", "f5.username", "f5.password"} {
+		if !strings.Contains(message, fragment) {
+			t.Fatalf("expected validation error to mention %q, got %q", fragment, message)
+		}
+	}
+}

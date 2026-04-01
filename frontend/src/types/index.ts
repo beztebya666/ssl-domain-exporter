@@ -82,6 +82,8 @@ export interface Domain {
   check_interval: number
   tags: string[]
   metadata: Record<string, string>
+  source_type: 'manual' | 'kubernetes_secret' | 'f5_certificate'
+  source_ref: Record<string, string>
   folder_id?: number | null
   sort_order: number
   custom_ca_pem: string
@@ -97,6 +99,8 @@ export interface DomainWritePayload {
   domain?: string
   tags?: string[] | string | null
   metadata?: Record<string, string> | null
+  source_type?: Domain['source_type']
+  source_ref?: Record<string, string> | null
   enabled?: boolean
   check_interval?: number
   custom_ca_pem?: string
@@ -158,7 +162,7 @@ export interface CustomField {
   id: number
   key: string
   label: string
-  type: 'text' | 'textarea' | 'email' | 'url' | 'date' | 'select'
+  type: 'text' | 'textarea' | 'email' | 'url' | 'date' | 'select' | 'number' | 'ip_address'
   required: boolean
   placeholder: string
   help_text: string
@@ -257,6 +261,15 @@ export interface Summary {
   critical: number
   error: number
   unknown: number
+  error_domains?: SummaryErrorDomain[]
+}
+
+export interface SummaryErrorDomain {
+  id: number
+  name: string
+  reason: string
+  ssl_error?: string
+  domain_error?: string
 }
 
 export interface AppConfig {
@@ -265,6 +278,11 @@ export interface AppConfig {
     host: string
     port: string
     allowed_origins: string[]
+    tls: {
+      enabled: boolean
+      cert_file: string
+      key_file: string
+    }
   }
   database: {
     path: string
@@ -382,6 +400,31 @@ export interface AppConfig {
   }
   logging: {
     json: boolean
+    syslog: {
+      enabled: boolean
+      network: 'tcp' | 'udp'
+      address: string
+      tag: string
+      facility: string
+    }
+  }
+  kubernetes: {
+    enabled: boolean
+    api_server: string
+    token: string
+    token_file: string
+    namespace: string
+    label_selector: string
+    insecure_skip_verify: boolean
+    ca_cert_file: string
+  }
+  f5: {
+    enabled: boolean
+    host: string
+    username: string
+    password: string
+    insecure_skip_verify: boolean
+    partition: string
   }
 }
 
@@ -436,6 +479,86 @@ export interface NotificationTestRequest {
   channel?: NotificationChannel
   features?: Pick<AppConfig['features'], 'notifications'>
   notifications?: AppConfig['notifications']
+}
+
+export interface SyslogTestResult {
+  success: boolean
+  message?: string
+  error?: string
+}
+
+export interface K8SCertificate {
+  namespace: string
+  secret_name: string
+  type: string
+  subject: string
+  issuer: string
+  serial: string
+  dns_names: string[]
+  not_before: string
+  not_after: string
+  expiry_days: number
+  is_expired: boolean
+  is_ca: boolean
+  error?: string
+}
+
+export interface K8SScanResult {
+  certificates: K8SCertificate[]
+  total: number
+  expired: number
+  warning: number
+  healthy: number
+  errors: number
+  scanned_at: string
+  error?: string
+}
+
+export interface F5Certificate {
+  name: string
+  partition: string
+  subject: string
+  issuer: string
+  not_before: string
+  not_after: string
+  expiry_days: number
+  is_expired: boolean
+  serial: string
+  key_type: string
+  error?: string
+}
+
+export interface F5ScanResult {
+  certificates: F5Certificate[]
+  total: number
+  expired: number
+  warning: number
+  healthy: number
+  errors: number
+  scanned_at: string
+  error?: string
+}
+
+export interface AdHocNotificationRequest {
+  channels?: NotificationChannel[]
+  subject?: string
+  message?: string
+  email_to?: string[]
+  webhook_url?: string
+  telegram_bot_token?: string
+  telegram_chat_id?: string
+}
+
+export interface AdHocNotificationResult {
+  channel: NotificationChannel
+  success: boolean
+  error?: string
+  recipients?: string[]
+}
+
+export interface AdHocNotificationResponse {
+  domain: string
+  results: AdHocNotificationResult[]
 }
 
 export interface UserAccount {

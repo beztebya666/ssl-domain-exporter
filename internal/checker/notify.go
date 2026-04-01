@@ -737,4 +737,51 @@ func notificationChannels(channel string) ([]string, error) {
 	}
 }
 
+// BuildAdHocMessage constructs a human-readable notification message for ad-hoc alerts.
+func BuildAdHocMessage(domain string, check *db.Check) string {
+	lines := []string{
+		"SSL Domain Exporter — Ad-hoc Alert",
+		"",
+		fmt.Sprintf("Domain: %s", domain),
+	}
+	if check != nil {
+		lines = append(lines, fmt.Sprintf("Status: %s", strings.ToUpper(check.OverallStatus)))
+		if check.PrimaryReasonText != "" {
+			lines = append(lines, fmt.Sprintf("Primary reason: %s", check.PrimaryReasonText))
+		}
+		if check.SSLExpiryDays != nil {
+			lines = append(lines, fmt.Sprintf("SSL expires in: %d days", *check.SSLExpiryDays))
+		}
+		if check.DomainExpiryDays != nil {
+			lines = append(lines, fmt.Sprintf("Domain expires in: %d days", *check.DomainExpiryDays))
+		}
+		if check.SSLCheckError != "" {
+			lines = append(lines, fmt.Sprintf("SSL error: %s", check.SSLCheckError))
+		}
+		lines = append(lines, fmt.Sprintf("Last checked: %s", check.CheckedAt.Format(time.RFC3339)))
+	}
+	lines = append(lines, "", fmt.Sprintf("Sent at: %s", time.Now().UTC().Format(time.RFC3339)))
+	return strings.Join(lines, "\n")
+}
+
+// NotificationTimeoutFromConfig extracts the notification timeout from config.
+func NotificationTimeoutFromConfig(cfg *config.Config) time.Duration {
+	return notificationTimeout(cfg)
+}
+
+// SendWebhookDirect sends a webhook message directly (synchronous, no retry).
+func SendWebhookDirect(url, message string, timeout time.Duration) error {
+	return sendWebhook(url, message, timeout)
+}
+
+// SendTelegramDirect sends a telegram message directly (synchronous, no retry).
+func SendTelegramDirect(botToken, chatID, message string, timeout time.Duration) error {
+	return sendTelegram(botToken, chatID, message, timeout)
+}
+
+// SendEmailDirect sends an email directly using the given config (synchronous, no retry).
+func SendEmailDirect(cfg config.EmailConfig, subject, message string, timeout time.Duration) error {
+	return sendEmail(cfg, subject, message, timeout)
+}
+
 type ginH map[string]any

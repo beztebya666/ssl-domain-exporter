@@ -230,8 +230,8 @@ func buildDomainListWhere(query DomainListQuery) (string, []any) {
 
 	if search := strings.ToLower(strings.TrimSpace(query.Search)); search != "" {
 		pattern := "%" + search + "%"
-		clauses = append(clauses, `(lower(d.name) LIKE ? OR EXISTS (SELECT 1 FROM json_each(coalesce(d.tags_json, '[]')) AS tag WHERE lower(tag.value) LIKE ?) OR lower(coalesce(d.metadata_json, '')) LIKE ?)`)
-		args = append(args, pattern, pattern, pattern)
+		clauses = append(clauses, `(lower(d.name) LIKE ? OR lower(coalesce(d.source_type, 'manual')) LIKE ? OR lower(coalesce(d.source_ref_json, '')) LIKE ? OR EXISTS (SELECT 1 FROM json_each(coalesce(d.tags_json, '[]')) AS tag WHERE lower(tag.value) LIKE ?) OR lower(coalesce(d.metadata_json, '')) LIKE ?)`)
+		args = append(args, pattern, pattern, pattern, pattern, pattern)
 	}
 
 	if status := strings.ToLower(strings.TrimSpace(query.Status)); status != "" && status != "all" {

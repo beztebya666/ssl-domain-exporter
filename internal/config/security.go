@@ -40,6 +40,8 @@ func (c *Config) RedactSecrets() {
 	c.Notifications.Webhook.URL = redactSecretValue(c.Notifications.Webhook.URL)
 	c.Notifications.Telegram.BotToken = redactSecretValue(c.Notifications.Telegram.BotToken)
 	c.Notifications.Email.Password = redactSecretValue(c.Notifications.Email.Password)
+	c.Kubernetes.Token = redactSecretValue(c.Kubernetes.Token)
+	c.F5.Password = redactSecretValue(c.F5.Password)
 }
 
 func (c *Config) RestoreRedactedSecrets(current *Config) {
@@ -60,6 +62,12 @@ func (c *Config) RestoreRedactedSecrets(current *Config) {
 	}
 	if c.Notifications.Email.Password == RedactedSecret {
 		c.Notifications.Email.Password = current.Notifications.Email.Password
+	}
+	if c.Kubernetes.Token == RedactedSecret {
+		c.Kubernetes.Token = current.Kubernetes.Token
+	}
+	if c.F5.Password == RedactedSecret {
+		c.F5.Password = current.F5.Password
 	}
 }
 
@@ -95,6 +103,15 @@ func (c *Config) Validate() error {
 	for _, origin := range c.Server.AllowedOrigins {
 		if err := validateAllowedOrigin(origin); err != nil {
 			issues = append(issues, fmt.Sprintf("server.allowed_origins contains invalid entry %q: %v", origin, err))
+		}
+	}
+
+	if c.Server.TLS.Enabled {
+		if strings.TrimSpace(c.Server.TLS.CertFile) == "" {
+			issues = append(issues, "server.tls.cert_file is required when TLS is enabled")
+		}
+		if strings.TrimSpace(c.Server.TLS.KeyFile) == "" {
+			issues = append(issues, "server.tls.key_file is required when TLS is enabled")
 		}
 	}
 
@@ -190,6 +207,31 @@ func (c *Config) Validate() error {
 	}
 	if c.Maintenance.AuditRetentionDays < 0 {
 		issues = append(issues, "maintenance.audit_retention_days cannot be negative")
+	}
+
+	// Syslog validation
+	if c.Logging.Syslog.Enabled {
+		network := strings.ToLower(strings.TrimSpace(c.Logging.Syslog.Network))
+		if network != "tcp" && network != "udp" {
+			issues = append(issues, "logging.syslog.network must be tcp or udp")
+		}
+		if strings.TrimSpace(c.Logging.Syslog.Address) == "" {
+			issues = append(issues, "logging.syslog.address is required when syslog is enabled (e.g. syslog.example.com:514)")
+		} else if _, _, err := net.SplitHostPort(c.Logging.Syslog.Address); err != nil {
+			issues = append(issues, fmt.Sprintf("logging.syslog.address must be host:port: %v", err))
+		}
+	}
+
+	if c.F5.Enabled {
+		if strings.TrimSpace(c.F5.Host) == "" {
+			issues = append(issues, "f5.host is required when F5 monitoring is enabled")
+		}
+		if strings.TrimSpace(c.F5.Username) == "" {
+			issues = append(issues, "f5.username is required when F5 monitoring is enabled")
+		}
+		if strings.TrimSpace(c.F5.Password) == "" {
+			issues = append(issues, "f5.password is required when F5 monitoring is enabled")
+		}
 	}
 
 	validateNotificationSettings(&issues, c)

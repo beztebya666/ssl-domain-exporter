@@ -10,8 +10,8 @@ RUN npm run build
 FROM golang:1.21-alpine AS backend-builder
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
-ARG APP_VERSION=v1.3.0
-ARG UI_VERSION=v1.3.0
+ARG APP_VERSION=v1.4.0
+ARG UI_VERSION=v1.4.0
 ARG BUILD_TIME=unknown
 ARG GIT_COMMIT=unknown
 COPY go.mod go.sum ./
@@ -30,7 +30,8 @@ COPY --from=backend-builder /app/server .
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 RUN mkdir -p /app/data \
- && chown -R app:app /app
+ && chown -R app:app /app \
+ && chmod 0775 /app/data
 
 EXPOSE 8080
 
@@ -40,7 +41,7 @@ ENV GIN_MODE=release \
     CONFIG_DIR=/app/data
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost:8080/health || exit 1
+  CMD wget -qO- http://127.0.0.1:8080/health || wget -qO- --no-check-certificate https://127.0.0.1:8080/health || exit 1
 
 USER app
 

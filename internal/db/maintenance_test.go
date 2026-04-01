@@ -50,7 +50,7 @@ func TestBackupToAndRestoreSQLiteFile(t *testing.T) {
 	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate db: %v", err)
 	}
-	if _, err := database.CreateDomain("backup.example.com", []string{"prod"}, map[string]string{"owner": "platform"}, "", "full", "", 3600, 443, nil); err != nil {
+	if _, err := database.CreateDomain("backup.example.com", []string{"prod"}, map[string]string{"owner": "platform"}, DomainSourceManual, nil, "", "full", "", 3600, 443, nil); err != nil {
 		t.Fatalf("seed domain before backup: %v", err)
 	}
 
@@ -90,7 +90,7 @@ func TestBackupToAndRestoreSQLiteFile(t *testing.T) {
 func TestDeleteChecksOlderThan(t *testing.T) {
 	database := newMaintenanceTestDB(t)
 
-	domain, err := database.CreateDomain("example.com", nil, nil, "", "full", "", 3600, 443, nil)
+	domain, err := database.CreateDomain("example.com", nil, nil, DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}

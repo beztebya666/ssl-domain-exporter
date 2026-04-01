@@ -14,7 +14,7 @@
 
 > Screenshot note: the exact interface can vary slightly by theme, viewport, and release build. The current UI includes responsive navigation, toast feedback, guided notification setup, and status-focused dashboard sections.
 
-Current version: `v1.3.0`
+Current version: `v1.4.0`
 
 dockerhub: https://hub.docker.com/r/beztebya666/ssl-domain-exporter
 
@@ -30,16 +30,21 @@ SSL Domain Exporter is a self-hosted service for monitoring SSL certificates (+c
 - **Structured metadata:** store owner, zone, requester, change ID, environment, or other inventory attributes as key/value metadata.
 - **Enterprise import:** line import and JSON batch import with `create_only`, `upsert`, `dry_run`, and optional immediate checks.
 - **Optional checks:** HTTP/HTTPS, cipher grade, OCSP, CRL, CAA.
-- **Per-domain settings:** HTTPS port, check interval, tags, metadata, folders, custom root CA (PEM), check mode, DNS servers.
+- **Per-item settings:** HTTPS port, check interval, tags, metadata, folders, custom root CA (PEM), check mode, DNS servers, and infrastructure source references for Kubernetes/F5-backed certificate inventory.
 - **UI:** responsive dashboard, domain list, domain details with history, Settings, Timeline (feature flag), mobile sidebar navigation, server-side sorting/filtering, pagination, large-list virtualization, and toast-based feedback.
 - **CSV export** (feature flag).
-- **Notifications:** Webhook, Telegram, and Email on status change to `warning` or `critical`.
+- **Notifications:** Webhook, Telegram, and Email on status change to `warning` or `critical`, plus ad-hoc notifications per domain.
 - **Notification setup wizard:** guided SMTP / webhook / Telegram setup with live channel tests and delivery status.
 - **Access model:** public read-only UI, local session-based users with `viewer` / `editor` / `admin` roles, plus legacy Basic/Auth API key compatibility.
 - **Status clarity:** each check stores an explainable primary reason plus detailed findings, and admins can decide which findings elevate the main list/dashboard badge versus remaining advisory-only.
 - **Dashboard signal separation:** operational alerts, expiry watchlist, and validation findings are shown as separate information groups.
 - **Theme-aware UX:** dark/light themes, custom status styling, responsive navigation, and reduced-motion friendly transitions.
 - **Prometheus endpoint** with registration-aware metrics and ready-to-use Grafana/Alertmanager files.
+- **Native TLS:** serve HTTPS directly without a reverse proxy via `server.tls` config.
+- **Syslog forwarding:** forward logs to a remote syslog server (RFC 3164) over TCP or UDP with auto-reconnect.
+- **Kubernetes scanning:** scan TLS secrets from Kubernetes clusters to monitor certificates managed by cert-manager or other controllers.
+- **F5 BIG-IP scanning:** monitor SSL certificates on F5 devices via the iControl REST API.
+- **Source-backed inventory:** create monitored items from manual endpoints, Kubernetes TLS secrets, or F5 BIG-IP certificates, either manually or directly from scan results in the UI.
 - **Cross-platform:** Linux, macOS, and Windows DNS discovery support.
 
 ## Check Modes
@@ -60,6 +65,56 @@ When registration check is skipped:
 - `domain_check_success{type="domain"}` metric is removed (not falsely set to 1)
 - `registration_check_skipped` and `registration_skip_reason` are stored in check history for audit
 - Notifications exclude domain registration info
+
+## Inventory Sources
+
+`v1.4.0` supports three inventory source types:
+
+- `manual`: classic hostname / HTTPS endpoint monitoring
+- `kubernetes_secret`: monitor a certificate directly from a Kubernetes TLS secret
+- `f5_certificate`: monitor a certificate directly from an F5 BIG-IP device
+
+How it behaves:
+
+- Manual items use the existing endpoint workflow: DNS resolution, TLS handshake, optional HTTP checks, and optional RDAP/WHOIS.
+- Kubernetes/F5 items are source-backed inventory records: the checker reads certificate metadata directly from the configured source reference on each run.
+- Source-backed items intentionally skip HTTP probing and domain registration lookup, because they are not tied to a public hostname by definition.
+- Check interval, tags, metadata, folders, enable/disable, notifications, history, dashboard status, and CSV export still work for all source types.
+
+UI flows:
+
+- **Add Domain** now lets you choose `Manual endpoint`, `Kubernetes TLS secret`, or `F5 BIG-IP certificate`.
+- **Settings -> Kubernetes TLS Secret Scanning** and **Settings -> F5 BIG-IP Certificate Scanning** now include a `Track` action that opens the add flow with the discovered source reference pre-filled.
+- **Domain Details** lets you edit the source type and source reference later without deleting the inventory item.
+
+Operational note:
+
+- Source-backed monitoring still requires the exporter host to reach the Kubernetes API or F5 API at runtime.
+- If the exporter cannot reach that source, the inventory item can still exist, but checks will return an error until connectivity/configuration is fixed.
+
+API examples:
+
+```json
+{
+  "source_type": "kubernetes_secret",
+  "source_ref": {
+    "namespace": "platform",
+    "secret_name": "ingress-tls",
+    "certificate_serial": "ABC123"
+  }
+}
+```
+
+```json
+{
+  "source_type": "f5_certificate",
+  "source_ref": {
+    "partition": "Common",
+    "certificate_name": "wildcard-example-com",
+    "serial": "5F01AA"
+  }
+}
+```
 
 ## Custom Root CA
 
@@ -116,7 +171,7 @@ Enterprise environments often need optional but standardized inventory fields su
 This release adds a schema-driven custom field layer on top of `metadata`:
 
 - Configure fields in **Settings -> Custom Inventory Fields**
-- Supported types: `text`, `textarea`, `email`, `url`, `date`, `select`
+- Supported types: `text`, `textarea`, `email`, `url`, `date`, `select`, `number`, `ip_address`
 - Per-field controls:
   - required / optional
   - enabled / disabled
@@ -146,6 +201,7 @@ Supported import features:
 - `trigger_checks` to queue immediate checks after import
 - `defaults` block for shared settings across all imported domains
 - Unknown top-level fields in import items are automatically stored in `metadata`
+- Import items can also carry `source_type` and `source_ref` so IaC workflows can manage Kubernetes/F5-backed inventory declaratively
 
 The web UI supports:
 
@@ -156,6 +212,37 @@ The web UI supports:
 - `SSL <= X days` and `Domain <= X days` inventory filters
 - CSV export that respects current filters
 - virtualized rendering for large domain lists
+
+Example JSON import with mixed inventory sources:
+
+```json
+{
+  "mode": "upsert",
+  "domains": [
+    {
+      "name": "example.com"
+    },
+    {
+      "source_type": "kubernetes_secret",
+      "source_ref": {
+        "namespace": "platform",
+        "secret_name": "ingress-tls"
+      },
+      "tags": ["k8s", "prod"]
+    },
+    {
+      "source_type": "f5_certificate",
+      "source_ref": {
+        "partition": "Common",
+        "certificate_name": "wildcard-example-com"
+      },
+      "metadata": {
+        "owner": "network-team"
+      }
+    }
+  ]
+}
+```
 
 ## DNS Resolution
 
@@ -247,10 +334,21 @@ go run ./cmd/server
 
 After that, the UI is available at `http://localhost:8080`.
 
-HTTPS note for `v1.3.0`:
+### Native TLS (HTTPS)
 
-- The application itself currently serves HTTP only.
-- If you need `https://`, place it behind a reverse proxy such as Nginx, Caddy, Traefik, or a Kubernetes ingress and terminate TLS there.
+Starting with `v1.4.0`, the server can terminate TLS natively without a reverse proxy:
+
+```yaml
+server:
+  tls:
+    enabled: true
+    cert_file: "/path/to/cert.pem"
+    key_file: "/path/to/key.pem"
+```
+
+Environment variables: `SERVER_TLS_ENABLED`, `SERVER_TLS_CERT_FILE`, `SERVER_TLS_KEY_FILE`.
+
+When TLS is enabled the server listens on HTTPS directly. You can still use a reverse proxy (Nginx, Caddy, Traefik, Kubernetes ingress) if you prefer external TLS termination — just leave `tls.enabled: false`.
 
 ## Docker
 
@@ -276,7 +374,7 @@ Container defaults:
 - SQLite data is stored at `/app/data/checker.db`
 - Backup files default to `/app/data/backups`
 - The container runs as an unprivileged user (`uid=10001`), so the mounted data directory must be writable by that user
-- For `v1.3.0`, the containerized app still listens on plain HTTP inside the container. If you need external HTTPS, terminate TLS in a reverse proxy/load balancer in front of it.
+- Starting with `v1.4.0`, the container can serve HTTPS natively via `server.tls` config. Alternatively, terminate TLS in a reverse proxy/load balancer in front of it.
 
 To pre-seed configuration, place your file at `./data/config.yaml` before first start:
 
@@ -340,6 +438,8 @@ Production secret strategy:
   - `WEBHOOK_URL_FILE`
   - `TELEGRAM_BOT_TOKEN_FILE`
   - `EMAIL_PASSWORD_FILE`
+  - `K8S_TOKEN_FILE`
+  - `F5_PASSWORD_FILE`
 
 Safe-start example:
 
@@ -348,6 +448,10 @@ server:
   host: "0.0.0.0"
   port: "8080"
   allowed_origins: []      # optional CORS allowlist for split UI/API deployments
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
 
 database:
   path: "./data/checker.db"
@@ -414,6 +518,15 @@ notifications:
     on_warning: true
     subject_prefix: "[SSL Domain Exporter]"
 
+logging:
+  json: false
+  syslog:
+    enabled: false
+    network: "udp"
+    address: ""
+    tag: "ssl-domain-exporter"
+    facility: "local0"
+
 prometheus:
   enabled: true
   path: "/metrics"
@@ -421,6 +534,24 @@ prometheus:
     export_tags: true
     export_metadata: true
     metadata_keys: []              # empty = export all metadata keys
+
+kubernetes:
+  enabled: false
+  api_server: ""
+  token: ""
+  token_file: ""
+  namespace: ""
+  label_selector: ""
+  insecure_skip_verify: false
+  ca_cert_file: ""
+
+f5:
+  enabled: false
+  host: ""
+  username: ""
+  password: ""
+  insecure_skip_verify: false
+  partition: ""
 ```
 
 `status_policy` can also be tuned quickly from the UI with presets:
@@ -507,6 +638,7 @@ If you use cookie-based browser sessions outside the built-in UI, send `X-CSRF-T
 - `PUT /api/config`
 - `GET /api/notifications/status`
 - `POST /api/notifications/test` - tests the selected channel; the Settings UI sends the current unsaved notification form values
+- `POST /api/syslog/test` - test syslog connectivity (accepts optional config override in body)
 - `GET /api/audit-logs`
 - `GET /api/maintenance/backups`
 - `POST /api/maintenance/backup`
@@ -528,9 +660,18 @@ If you use cookie-based browser sessions outside the built-in UI, send `X-CSRF-T
 - `POST /api/domains/import` - batch import API for line/JSON/IaC workflows
 - `DELETE /api/domains/:id`
 - `POST /api/domains/:id/check`
+- `POST /api/domains/:id/notify` - send ad-hoc notification for a domain (editor+)
 - `GET /api/domains/:id/history?limit=50`
 - `POST /api/domains/reorder`
 - `GET /api/domains/export.csv` (only when `features.csv_export=true`)
+
+Create / update payloads support:
+
+- `source_type`: `manual`, `kubernetes_secret`, `f5_certificate`
+- `source_ref`: source-specific object:
+  - Kubernetes: `namespace`, `secret_name`, optional `certificate_serial`
+  - F5: `partition`, `certificate_name`, optional `serial`
+- For source-backed items, `name` becomes optional and is auto-generated as `k8s:<namespace>/<secret>` or `f5:<partition>/<certificate>`
 
 ### Folders
 
@@ -549,6 +690,11 @@ If you use cookie-based browser sessions outside the built-in UI, send `X-CSRF-T
 ### Tags
 
 - `GET /api/tags`
+
+### Infrastructure Scanning
+
+- `GET /api/k8s/certificates` - scan Kubernetes TLS secrets (admin)
+- `GET /api/f5/certificates` - scan F5 BIG-IP SSL certificates (admin)
 
 ### Summary
 
@@ -653,6 +799,96 @@ Flags in `config.yaml -> features`:
 - `dashboard_tag_filter`
 - `structured_logs`
 
+## Syslog Forwarding
+
+Logs can be forwarded to a remote syslog server (RFC 3164) in addition to stdout:
+
+```yaml
+logging:
+  syslog:
+    enabled: true
+    network: "udp"        # "tcp" or "udp"
+    address: "syslog.example.com:514"
+    tag: "ssl-domain-exporter"
+    facility: "local0"    # kern, user, daemon, local0–local7
+```
+
+Environment variables: `SYSLOG_ENABLED`, `SYSLOG_NETWORK`, `SYSLOG_ADDRESS`, `SYSLOG_TAG`, `SYSLOG_FACILITY`.
+
+The writer auto-reconnects on connection failures. You can test connectivity via the API:
+
+```bash
+curl -X POST -u admin:<password> http://localhost:8080/api/syslog/test
+```
+
+## Kubernetes TLS Secret Scanning
+
+Scan Kubernetes TLS secrets to monitor certificates managed by cert-manager or other controllers:
+
+```yaml
+kubernetes:
+  enabled: true
+  api_server: "https://kubernetes.default.svc"
+  token_file: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+  namespace: ""                  # empty = all namespaces
+  label_selector: ""             # optional, e.g. "app=my-app"
+  insecure_skip_verify: false
+  ca_cert_file: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+```
+
+Environment variables: `K8S_ENABLED`, `K8S_API_SERVER`, `K8S_TOKEN`, `K8S_TOKEN_FILE`, `K8S_NAMESPACE`, `K8S_LABEL_SELECTOR`, `K8S_CA_CERT_FILE`, `K8S_INSECURE_SKIP_VERIFY`.
+
+Scan on demand:
+
+```bash
+curl -u admin:<password> http://localhost:8080/api/k8s/certificates
+```
+
+Returns parsed certificate details (subject, issuer, expiry, serial) for every `kubernetes.io/tls` secret matched by the configured namespace and label selector. The UI can also convert a discovered certificate into a tracked inventory item with one click.
+
+## F5 BIG-IP Certificate Scanning
+
+Monitor SSL certificates on F5 BIG-IP devices via the iControl REST API:
+
+```yaml
+f5:
+  enabled: true
+  host: "https://f5.example.com"
+  username: "admin"
+  password: "change-me"
+  insecure_skip_verify: false
+  partition: ""                  # empty = all partitions
+```
+
+Environment variables: `F5_ENABLED`, `F5_HOST`, `F5_USERNAME`, `F5_PASSWORD`, `F5_PASSWORD_FILE`, `F5_INSECURE_SKIP_VERIFY`, `F5_PARTITION`.
+
+Scan on demand:
+
+```bash
+curl -u admin:<password> http://localhost:8080/api/f5/certificates
+```
+
+Returns certificate inventory (name, partition, subject, issuer, expiry, serial, key type) from the F5 device. The UI can also convert a discovered certificate into a tracked inventory item with one click.
+
+## Ad-hoc Notifications
+
+Send a one-off notification for any monitored domain, useful for manual escalation or sharing status with colleagues:
+
+```bash
+curl -X POST -u admin:<password> \
+  -H "Content-Type: application/json" \
+  -d '{"channels":["telegram"],"message":"Certificate renewing tomorrow"}' \
+  http://localhost:8080/api/domains/1/notify
+```
+
+Supported options in the request body:
+- `channels`: array of `"webhook"`, `"telegram"`, `"email"` (default: all enabled channels)
+- `message`: custom message text (default: auto-generated from latest check)
+- `subject`: custom email subject (email channel only)
+- `webhook_url`, `telegram_bot_token`, `telegram_chat_id`: override per-request delivery targets
+- `email_to`: override email recipients for this request (string or array)
+- `recipients`: legacy alias for `email_to`
+
 ## Prometheus and Monitoring
 
 Metrics are exposed at `prometheus.path` (default: `/metrics`).
@@ -730,12 +966,16 @@ Overrides are supported for most settings, for example:
 - `WEBHOOK_*`, `TELEGRAM_*`
 - `SECURITY_*` (`SECURITY_CSRF_ENABLED`, `SECURITY_LOGIN_REQUESTS`, ...)
 - `MAINTENANCE_*` (`MAINTENANCE_BACKUPS_DIR`, `MAINTENANCE_CHECK_RETENTION_DAYS`, `MAINTENANCE_AUDIT_RETENTION_DAYS`, ...)
+- `SERVER_TLS_ENABLED`, `SERVER_TLS_CERT_FILE`, `SERVER_TLS_KEY_FILE`
 - `LOG_JSON`
+- `SYSLOG_ENABLED`, `SYSLOG_NETWORK`, `SYSLOG_ADDRESS`, `SYSLOG_TAG`, `SYSLOG_FACILITY`
 - `DNS_SERVERS` (comma-separated, e.g. `10.0.0.1:53,10.0.0.2:53`)
 - `DNS_USE_SYSTEM_DNS` (`true`/`false`)
 - `DNS_TIMEOUT` (e.g. `5s`)
 - `DEFAULT_CHECK_MODE` (`full` or `ssl_only`)
-- Secret file envs: `AUTH_PASSWORD_FILE`, `AUTH_API_KEY_FILE`, `WEBHOOK_URL_FILE`, `TELEGRAM_BOT_TOKEN_FILE`, `EMAIL_PASSWORD_FILE`
+- `K8S_ENABLED`, `K8S_API_SERVER`, `K8S_TOKEN`, `K8S_TOKEN_FILE`, `K8S_NAMESPACE`, `K8S_LABEL_SELECTOR`, `K8S_CA_CERT_FILE`, `K8S_INSECURE_SKIP_VERIFY`
+- `F5_ENABLED`, `F5_HOST`, `F5_USERNAME`, `F5_PASSWORD`, `F5_PASSWORD_FILE`, `F5_INSECURE_SKIP_VERIFY`, `F5_PARTITION`
+- Secret file envs: `AUTH_PASSWORD_FILE`, `AUTH_API_KEY_FILE`, `WEBHOOK_URL_FILE`, `TELEGRAM_BOT_TOKEN_FILE`, `EMAIL_PASSWORD_FILE`, `K8S_TOKEN_FILE`, `F5_PASSWORD_FILE`
 
 Full list: `internal/config/config.go` (`applyEnvOverrides`).
 
@@ -769,4 +1009,4 @@ data                  # SQLite DB (runtime)
 - Per-domain `check_interval` controls scheduling cadence, while `checker.retry_count` controls immediate retry attempts for transient check failures inside a single run.
 - With auth enabled, `/api` protection is on by default (`protect_api: true`).
 - Runtime config access is thread-safe: reads go through `Snapshot()`, runtime updates apply via `ApplyFrom()`, and `Save()` writes a normalized snapshot to disk.
-- Restart is required for startup-only settings such as `server.host`, `server.port`, `database.path`, `checker.concurrent_checks`, `prometheus.enabled`, `prometheus.path`, `logging.json`, and `features.structured_logs`.
+- Restart is required for startup-only settings such as `server.host`, `server.port`, `server.tls.*`, `database.path`, `checker.concurrent_checks`, `prometheus.enabled`, `prometheus.path`, `logging.json`, `logging.syslog.*`, and `features.structured_logs`.

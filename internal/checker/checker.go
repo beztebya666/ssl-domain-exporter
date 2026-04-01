@@ -90,6 +90,31 @@ func (c *Checker) CheckDomain(domain *db.Domain) *db.Check {
 }
 
 func (c *Checker) runCheckOnce(domain *db.Domain, cfg *config.Config, timeout time.Duration) *db.Check {
+	switch domain.EffectiveSourceType() {
+	case db.DomainSourceManual:
+		return c.runManualCheckOnce(domain, cfg, timeout)
+	case db.DomainSourceKubernetesSecret:
+		return c.runKubernetesSourceCheck(domain)
+	case db.DomainSourceF5Certificate:
+		return c.runF5SourceCheck(domain)
+	default:
+		check := &db.Check{
+			DomainID:                  domain.ID,
+			CheckedAt:                 time.Now(),
+			RegistrationCheckSkipped:  true,
+			RegistrationSkipReason:    "unsupported_source_type",
+			DomainStatus:              "not_applicable",
+			DomainSource:              "source",
+			SSLCheckError:             fmt.Sprintf("unsupported source_type %q", domain.SourceType),
+			PrimaryReasonCode:         "ssl_check_failed",
+			PrimaryReasonText:         fmt.Sprintf("Unsupported source type %q", domain.SourceType),
+			OverallStatus:             "error",
+		}
+		return check
+	}
+}
+
+func (c *Checker) runManualCheckOnce(domain *db.Domain, cfg *config.Config, timeout time.Duration) *db.Check {
 	check := &db.Check{
 		DomainID:  domain.ID,
 		CheckedAt: time.Now(),

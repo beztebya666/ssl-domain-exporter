@@ -3,8 +3,10 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"net"
 	"net/mail"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -50,6 +52,10 @@ func NormalizeCustomFieldType(value string) string {
 		return "date"
 	case "select":
 		return "select"
+	case "number":
+		return "number"
+	case "ip", "ip_address":
+		return "ip_address"
 	default:
 		return "text"
 	}
@@ -297,6 +303,14 @@ func validateCustomFieldValue(field CustomField, value string) error {
 	case "date":
 		if _, err := time.Parse("2006-01-02", value); err != nil {
 			return fmt.Errorf("%s must use YYYY-MM-DD format", field.Label)
+		}
+	case "number":
+		if _, err := strconv.ParseFloat(value, 64); err != nil {
+			return fmt.Errorf("%s must be a valid number", field.Label)
+		}
+	case "ip_address":
+		if net.ParseIP(value) == nil {
+			return fmt.Errorf("%s must be a valid IP address (IPv4 or IPv6)", field.Label)
 		}
 	case "select":
 		allowed := make(map[string]struct{}, len(field.Options))
