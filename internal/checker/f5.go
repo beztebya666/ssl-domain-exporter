@@ -78,14 +78,10 @@ func ScanF5Certificates(cfg F5Config, warningDays int) (*F5ScanResult, error) {
 		return result, fmt.Errorf("F5 monitoring is not enabled")
 	}
 
-	host := strings.TrimRight(strings.TrimSpace(cfg.Host), "/")
+	host := strings.TrimSpace(cfg.Host)
 	if host == "" {
 		result.Error = "F5 host is required"
 		return result, fmt.Errorf("F5 host is required")
-	}
-
-	if !strings.HasPrefix(host, "https://") && !strings.HasPrefix(host, "http://") {
-		host = "https://" + host
 	}
 
 	certResp, err := listF5Certificates(cfg, strings.TrimSpace(cfg.Partition), "")
