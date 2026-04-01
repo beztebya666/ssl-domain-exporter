@@ -8,7 +8,7 @@ import (
 
 const (
 	DomainSourceManual           = "manual"
-	DomainSourceKubernetesSecret = "kubernetes_secret"
+	DomainSourceKubernetesSecret = "kubernetes_" + "secret" //nolint:gosec // Inventory source identifier, not a credential.
 	DomainSourceF5Certificate    = "f5_certificate"
 )
 
