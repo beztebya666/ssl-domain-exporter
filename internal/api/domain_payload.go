@@ -21,6 +21,10 @@ type domainInput struct {
 
 	CustomCAPEM    string
 	HasCustomCAPEM bool
+	SourceType     string
+	HasSourceType  bool
+	SourceRef      map[string]string
+	HasSourceRef   bool
 	CheckMode      string
 	HasCheckMode   bool
 	DNSServers     string
@@ -42,6 +46,8 @@ type createDomainRequest struct {
 	Domain      string          `json:"domain"`
 	Tags        json.RawMessage `json:"tags"`
 	Metadata    json.RawMessage `json:"metadata"`
+	SourceType  string          `json:"source_type"`
+	SourceRef   json.RawMessage `json:"source_ref"`
 	CustomCAPEM string          `json:"custom_ca_pem"`
 	CheckMode   string          `json:"check_mode"`
 	DNSServers  string          `json:"dns_servers"`
@@ -56,6 +62,8 @@ type updateDomainRequest struct {
 	Domain      *string          `json:"domain"`
 	Tags        *json.RawMessage `json:"tags"`
 	Metadata    *json.RawMessage `json:"metadata"`
+	SourceType  *string          `json:"source_type"`
+	SourceRef   *json.RawMessage `json:"source_ref"`
 	CustomCAPEM *string          `json:"custom_ca_pem"`
 	CheckMode   *string          `json:"check_mode"`
 	DNSServers  *string          `json:"dns_servers"`
@@ -97,18 +105,17 @@ type importDomainsResponse struct {
 }
 
 func buildCreateInput(req createDomainRequest, cfg *config.Config) (domainInput, error) {
+	sourceType := db.NormalizeSourceType(req.SourceType)
 	in := domainInput{
-		Name:        normalizeDomain(firstNonEmpty(req.Name, req.Domain)),
+		Name:        normalizeInventoryName(sourceType, firstNonEmpty(req.Name, req.Domain)),
+		SourceType:  sourceType,
 		CustomCAPEM: strings.TrimSpace(req.CustomCAPEM),
 		DNSServers:  strings.TrimSpace(req.DNSServers),
 		Interval:    req.Interval,
 		Port:        req.Port,
 		FolderID:    sanitizeFolderID(req.FolderID),
 	}
-	if in.Name == "" {
-		return domainInput{}, fmt.Errorf("name is required")
-	}
-	in.HasName = true
+	in.HasSourceType = true
 
 	tags, _, err := parseTagsJSON(req.Tags)
 	if err != nil {
@@ -123,6 +130,24 @@ func buildCreateInput(req createDomainRequest, cfg *config.Config) (domainInput,
 	}
 	in.Metadata = metadata
 	in.HasMetadata = len(req.Metadata) > 0
+
+	sourceRef, _, err := parseSourceRefJSON(req.SourceRef)
+	if err != nil {
+		return domainInput{}, err
+	}
+	sourceRef, err = db.ValidateAndNormalizeSourceRef(sourceType, sourceRef)
+	if err != nil {
+		return domainInput{}, err
+	}
+	in.SourceRef = sourceRef
+	in.HasSourceRef = len(req.SourceRef) > 0
+	if in.Name == "" {
+		in.Name = db.SourceDisplayName(sourceType, sourceRef)
+	}
+	if in.Name == "" {
+		return domainInput{}, fmt.Errorf("name is required")
+	}
+	in.HasName = true
 
 	if strings.TrimSpace(req.CheckMode) != "" {
 		in.CheckMode = config.ValidateCheckMode(req.CheckMode)
@@ -140,8 +165,14 @@ func buildCreateInput(req createDomainRequest, cfg *config.Config) (domainInput,
 
 func buildUpdateInput(req updateDomainRequest) (domainInput, error) {
 	in := domainInput{}
+	sourceType := ""
+	if req.SourceType != nil {
+		sourceType = db.NormalizeSourceType(*req.SourceType)
+		in.SourceType = sourceType
+		in.HasSourceType = true
+	}
 	if req.Name != nil || req.Domain != nil {
-		in.Name = normalizeDomain(firstNonEmpty(derefString(req.Name), derefString(req.Domain)))
+		in.Name = strings.TrimSpace(firstNonEmpty(derefString(req.Name), derefString(req.Domain)))
 		if in.Name == "" {
 			return domainInput{}, fmt.Errorf("name is required")
 		}
@@ -169,6 +200,14 @@ func buildUpdateInput(req updateDomainRequest) (domainInput, error) {
 	if req.CustomCAPEM != nil {
 		in.CustomCAPEM = strings.TrimSpace(*req.CustomCAPEM)
 		in.HasCustomCAPEM = true
+	}
+	if req.SourceRef != nil {
+		sourceRef, _, err := parseSourceRefJSON(*req.SourceRef)
+		if err != nil {
+			return domainInput{}, err
+		}
+		in.SourceRef = sourceRef
+		in.HasSourceRef = true
 	}
 	if req.CheckMode != nil {
 		in.CheckMode = config.ValidateCheckMode(*req.CheckMode)
@@ -210,9 +249,7 @@ func parseImportMap(raw map[string]any, requireName bool) (domainInput, error) {
 			if err != nil {
 				return domainInput{}, fmt.Errorf("%s: %w", key, err)
 			}
-			if s != "" {
-				in.Name = normalizeDomain(s)
-			}
+			in.Name = strings.TrimSpace(s)
 		case "tags":
 			tags, err := parseTagsAny(value)
 			if err != nil {
@@ -234,6 +271,20 @@ func parseImportMap(raw map[string]any, requireName bool) (domainInput, error) {
 			}
 			in.CustomCAPEM = strings.TrimSpace(s)
 			in.HasCustomCAPEM = true
+		case "source_type":
+			s, err := asString(value)
+			if err != nil {
+				return domainInput{}, fmt.Errorf("source_type: %w", err)
+			}
+			in.SourceType = db.NormalizeSourceType(s)
+			in.HasSourceType = true
+		case "source_ref":
+			sourceRef, err := parseSourceRefAny(value)
+			if err != nil {
+				return domainInput{}, fmt.Errorf("source_ref: %w", err)
+			}
+			in.SourceRef = sourceRef
+			in.HasSourceRef = true
 		case "check_mode":
 			s, err := asString(value)
 			if err != nil {
@@ -290,8 +341,28 @@ func parseImportMap(raw map[string]any, requireName bool) (domainInput, error) {
 		}
 	}
 
+	if in.HasSourceType {
+		in.Name = normalizeInventoryName(in.SourceType, in.Name)
+	} else if in.Name != "" {
+		in.Name = normalizeDomain(in.Name)
+	}
+
 	if requireName && in.Name == "" {
-		return domainInput{}, fmt.Errorf("name/domain is required")
+		sourceType := db.DomainSourceManual
+		if in.HasSourceType {
+			sourceType = in.SourceType
+		}
+		sourceRef, err := db.ValidateAndNormalizeSourceRef(sourceType, in.SourceRef)
+		if err != nil {
+			return domainInput{}, err
+		}
+		in.SourceRef = sourceRef
+		if generatedName := db.SourceDisplayName(sourceType, sourceRef); generatedName != "" {
+			in.Name = generatedName
+		}
+		if in.Name == "" {
+			return domainInput{}, fmt.Errorf("name/domain is required")
+		}
 	}
 	if len(extraMetadata) > 0 {
 		if in.Metadata == nil {
@@ -334,6 +405,14 @@ func mergeImportDefaults(defaults, item domainInput) domainInput {
 	if !out.HasCustomCAPEM && defaults.HasCustomCAPEM {
 		out.CustomCAPEM = defaults.CustomCAPEM
 		out.HasCustomCAPEM = true
+	}
+	if !out.HasSourceType && defaults.HasSourceType {
+		out.SourceType = defaults.SourceType
+		out.HasSourceType = true
+	}
+	if !out.HasSourceRef && defaults.HasSourceRef {
+		out.SourceRef = db.CloneSourceRef(defaults.SourceRef)
+		out.HasSourceRef = true
 	}
 	if !out.HasCheckMode && defaults.HasCheckMode {
 		out.CheckMode = defaults.CheckMode
@@ -399,6 +478,24 @@ func parseMetadataJSON(raw json.RawMessage) (map[string]string, bool, error) {
 	return metadata, true, nil
 }
 
+func parseSourceRefJSON(raw json.RawMessage) (map[string]string, bool, error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	if string(raw) == "null" {
+		return nil, true, nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, false, fmt.Errorf("source_ref must be an object or null")
+	}
+	sourceRef, err := parseSourceRefAny(obj)
+	if err != nil {
+		return nil, false, err
+	}
+	return sourceRef, true, nil
+}
+
 func parseTagsAny(value any) ([]string, error) {
 	switch v := value.(type) {
 	case nil:
@@ -440,6 +537,26 @@ func parseMetadataAny(value any) (map[string]string, error) {
 		metadata[key] = strValue
 	}
 	return db.ValidateAndNormalizeMetadata(metadata)
+}
+
+func parseSourceRefAny(value any) (map[string]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an object or null")
+	}
+
+	sourceRef := make(map[string]string, len(obj))
+	for key, raw := range obj {
+		strValue, err := stringifyImportValue(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		sourceRef[key] = strValue
+	}
+	return sourceRef, nil
 }
 
 func stringifyImportValue(value any) (string, error) {
@@ -550,4 +667,12 @@ func derefString(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func normalizeInventoryName(sourceType, raw string) string {
+	sourceType = db.NormalizeSourceType(sourceType)
+	if sourceType == db.DomainSourceManual {
+		return normalizeDomain(raw)
+	}
+	return strings.TrimSpace(raw)
 }

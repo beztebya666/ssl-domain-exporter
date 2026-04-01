@@ -10,7 +10,7 @@ import { Skeleton } from './Skeleton'
 import { useToast } from './ToastProvider'
 import { getErrorMessage } from '../lib/utils'
 
-const FIELD_TYPES: Array<CustomField['type']> = ['text', 'textarea', 'email', 'url', 'date', 'select']
+const FIELD_TYPES: Array<CustomField['type']> = ['text', 'textarea', 'email', 'url', 'date', 'select', 'number', 'ip_address']
 
 function emptyDraft(nextSortOrder: number): CustomFieldWritePayload {
   return {

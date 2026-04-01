@@ -31,7 +31,7 @@ func TestUpdateDomainPreservesExistingFieldsWhenOmitted(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := metrics.NewWithRegisterer(reg)
 
-	domain, err := database.CreateDomain("old.internal", []string{"infra"}, map[string]string{"owner": "platform"}, "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----", "ssl_only", "10.0.0.1:53", 3600, 8443, nil)
+	domain, err := database.CreateDomain("old.internal", []string{"infra"}, map[string]string{"owner": "platform"}, db.DomainSourceManual, nil, "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----", "ssl_only", "10.0.0.1:53", 3600, 8443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestImportDomainsSupportsMetadataAndUpsert(t *testing.T) {
 	database := newHandlerTestDB(t)
 	defer database.Close()
 
-	existing, err := database.CreateDomain("existing.internal", []string{"legacy"}, map[string]string{"owner": "legacy-team"}, "", "full", "", 3600, 443, nil)
+	existing, err := database.CreateDomain("existing.internal", []string{"legacy"}, map[string]string{"owner": "legacy-team"}, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create existing domain: %v", err)
 	}
@@ -201,6 +201,70 @@ func TestImportDomainsSupportsMetadataAndUpsert(t *testing.T) {
 	}
 }
 
+func TestCreateDomainSupportsKubernetesSourceAndSearchBySourceRef(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := config.Default()
+	database := newHandlerTestDB(t)
+	defer database.Close()
+
+	handler := NewHandler(cfg, database, nil, nil, nil)
+
+	body := []byte(`{
+		"source_type":"kubernetes_secret",
+		"source_ref":{
+			"namespace":"platform",
+			"secret_name":"ingress-tls",
+			"certificate_serial":"ABC123"
+		},
+		"tags":["k8s","prod"],
+		"metadata":{"owner":"platform-team"}
+	}`)
+
+	createRec := httptest.NewRecorder()
+	createCtx, _ := gin.CreateTestContext(createRec)
+	createCtx.Request = httptest.NewRequest(http.MethodPost, "/api/domains", bytes.NewReader(body))
+	createCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.CreateDomain(createCtx)
+
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected create status: got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	var created db.Domain
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created domain: %v", err)
+	}
+	if created.Name != "k8s:platform/ingress-tls" {
+		t.Fatalf("unexpected generated name: %q", created.Name)
+	}
+	if created.SourceType != db.DomainSourceKubernetesSecret {
+		t.Fatalf("unexpected source type: %q", created.SourceType)
+	}
+	if created.SourceRef["namespace"] != "platform" || created.SourceRef["secret_name"] != "ingress-tls" || created.SourceRef["certificate_serial"] != "ABC123" {
+		t.Fatalf("unexpected source ref: %#v", created.SourceRef)
+	}
+
+	searchRec := httptest.NewRecorder()
+	searchCtx, _ := gin.CreateTestContext(searchRec)
+	searchCtx.Request = httptest.NewRequest(http.MethodGet, "/api/domains/search?search=ingress-tls", nil)
+
+	handler.SearchDomains(searchCtx)
+
+	if searchRec.Code != http.StatusOK {
+		t.Fatalf("unexpected search status: got %d body=%s", searchRec.Code, searchRec.Body.String())
+	}
+
+	var searchResp domainListResponse
+	if err := json.Unmarshal(searchRec.Body.Bytes(), &searchResp); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	if searchResp.Total != 1 || len(searchResp.Items) != 1 || searchResp.Items[0].ID != created.ID {
+		t.Fatalf("unexpected source-backed search result: %+v", searchResp)
+	}
+}
+
 func TestSearchDomainsSupportsServerSideFiltersAndPaging(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -217,15 +281,15 @@ func TestSearchDomainsSupportsServerSideFiltersAndPaging(t *testing.T) {
 		t.Fatalf("create folder B: %v", err)
 	}
 
-	alpha, err := database.CreateDomain("alpha.internal", []string{"prod"}, nil, "", "full", "", 3600, 443, &folderA.ID)
+	alpha, err := database.CreateDomain("alpha.internal", []string{"prod"}, nil, db.DomainSourceManual, nil, "", "full", "", 3600, 443, &folderA.ID)
 	if err != nil {
 		t.Fatalf("create alpha: %v", err)
 	}
-	beta, err := database.CreateDomain("beta.internal", []string{"prod"}, nil, "", "full", "", 3600, 443, &folderA.ID)
+	beta, err := database.CreateDomain("beta.internal", []string{"prod"}, nil, db.DomainSourceManual, nil, "", "full", "", 3600, 443, &folderA.ID)
 	if err != nil {
 		t.Fatalf("create beta: %v", err)
 	}
-	_, err = database.CreateDomain("gamma.internal", []string{"dev"}, nil, "", "full", "", 3600, 443, &folderB.ID)
+	_, err = database.CreateDomain("gamma.internal", []string{"dev"}, nil, db.DomainSourceManual, nil, "", "full", "", 3600, 443, &folderB.ID)
 	if err != nil {
 		t.Fatalf("create gamma: %v", err)
 	}
@@ -297,15 +361,15 @@ func TestGetTimelineReturnsPagedServerSideData(t *testing.T) {
 	database := newHandlerTestDB(t)
 	defer database.Close()
 
-	alpha, err := database.CreateDomain("alpha.internal", []string{"prod"}, nil, "", "full", "", 3600, 443, nil)
+	alpha, err := database.CreateDomain("alpha.internal", []string{"prod"}, nil, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create alpha: %v", err)
 	}
-	beta, err := database.CreateDomain("beta.internal", []string{"prod"}, nil, "", "full", "", 3600, 443, nil)
+	beta, err := database.CreateDomain("beta.internal", []string{"prod"}, nil, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create beta: %v", err)
 	}
-	gamma, err := database.CreateDomain("gamma.internal", []string{"prod"}, nil, "", "ssl_only", "", 3600, 443, nil)
+	gamma, err := database.CreateDomain("gamma.internal", []string{"prod"}, nil, db.DomainSourceManual, nil, "", "ssl_only", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create gamma: %v", err)
 	}
@@ -414,11 +478,11 @@ func TestExportDomainsCSVRespectsFilters(t *testing.T) {
 	database := newHandlerTestDB(t)
 	defer database.Close()
 
-	prod, err := database.CreateDomain("prod.internal", []string{"prod"}, map[string]string{"owner": "platform"}, "", "full", "", 3600, 443, nil)
+	prod, err := database.CreateDomain("prod.internal", []string{"prod"}, map[string]string{"owner": "platform"}, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create prod: %v", err)
 	}
-	dev, err := database.CreateDomain("dev.internal", []string{"dev"}, map[string]string{"owner": "qa"}, "", "full", "", 3600, 443, nil)
+	dev, err := database.CreateDomain("dev.internal", []string{"dev"}, map[string]string{"owner": "qa"}, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create dev: %v", err)
 	}
@@ -502,14 +566,14 @@ func TestCreateDomainValidatesRequiredCustomFieldsAndMetadataFiltersDriveSearchA
 	alpha, err := database.CreateDomain("alpha.internal", []string{"prod"}, map[string]string{
 		"owner_email": "alpha@example.com",
 		"zone":        "corp",
-	}, "", "full", "", 3600, 443, nil)
+	}, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create alpha: %v", err)
 	}
 	beta, err := database.CreateDomain("beta.internal", []string{"prod"}, map[string]string{
 		"owner_email": "beta@example.com",
 		"zone":        "corp",
-	}, "", "full", "", 3600, 443, nil)
+	}, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create beta: %v", err)
 	}
@@ -766,7 +830,7 @@ func TestGetSummaryNormalizesUnknownStatuses(t *testing.T) {
 	database := newHandlerTestDB(t)
 	defer database.Close()
 
-	domain, err := database.CreateDomain("mystery.internal", nil, nil, "", "full", "", 3600, 443, nil)
+	domain, err := database.CreateDomain("mystery.internal", nil, nil, db.DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}
@@ -791,12 +855,16 @@ func TestGetSummaryNormalizesUnknownStatuses(t *testing.T) {
 		t.Fatalf("unexpected status code: got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	var summary map[string]int
+	var summary map[string]json.RawMessage
 	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
 		t.Fatalf("decode summary: %v", err)
 	}
-	if summary["unknown"] != 1 {
-		t.Fatalf("expected unknown summary bucket to be incremented, got %+v", summary)
+	var unknownCount float64
+	if err := json.Unmarshal(summary["unknown"], &unknownCount); err != nil {
+		t.Fatalf("decode unknown count: %v", err)
+	}
+	if int(unknownCount) != 1 {
+		t.Fatalf("expected unknown summary bucket to be incremented, got %v", unknownCount)
 	}
 	if _, ok := summary["mystery"]; ok {
 		t.Fatalf("expected unexpected status to be normalized away, got %+v", summary)

@@ -104,5 +104,11 @@ func changedConfigSections(current, next *config.Config) []string {
 	if !reflect.DeepEqual(current.Logging, next.Logging) {
 		sections = append(sections, "logging")
 	}
+	if !reflect.DeepEqual(current.Kubernetes, next.Kubernetes) {
+		sections = append(sections, "kubernetes")
+	}
+	if !reflect.DeepEqual(current.F5, next.F5) {
+		sections = append(sections, "f5")
+	}
 	return sections
 }

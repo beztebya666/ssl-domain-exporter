@@ -179,3 +179,14 @@ func TestConcurrentSave(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestApplyEnvOverridesSupportsK8SLabelSelector(t *testing.T) {
+	t.Setenv("K8S_LABEL_SELECTOR", "app=ingress,environment=prod")
+
+	cfg := Default()
+	applyEnvOverrides(cfg)
+
+	if cfg.Kubernetes.LabelSelector != "app=ingress,environment=prod" {
+		t.Fatalf("expected label selector env override to apply, got %q", cfg.Kubernetes.LabelSelector)
+	}
+}

@@ -59,7 +59,7 @@ func TestNextWakeDelayUsesEarliestScheduledDomain(t *testing.T) {
 	cfg := config.Default()
 	database := newSchedulerTestDB(t)
 
-	domain, err := database.CreateDomain("example.com", nil, nil, "", "full", "", 1800, 443, nil)
+	domain, err := database.CreateDomain("example.com", nil, nil, db.DomainSourceManual, nil, "", "full", "", 1800, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}

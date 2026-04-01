@@ -22,8 +22,8 @@ import (
 )
 
 var (
-	AppVersion = "v1.3.0"
-	UIVersion  = "v1.3.0"
+	AppVersion = "v1.4.0"
+	UIVersion  = "v1.4.0"
 	BuildTime  = "unknown"
 	GitCommit  = "unknown"
 )
@@ -55,6 +55,13 @@ func main() {
 			*configPath = filepath.Join(*configDir, "config.yaml")
 		} else {
 			*configPath = "config.yaml"
+		}
+	}
+
+	// Ensure config directory exists and is writable before loading
+	if dir := filepath.Dir(*configPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			slog.Warn("Cannot create config directory", "path", dir, "error", err)
 		}
 	}
 
@@ -128,15 +135,26 @@ func main() {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		slog.Info("Server starting", "url", "http://"+cfg.Server.Host+":"+cfg.Server.Port)
+		scheme := "http"
+		if cfg.Server.TLS.Enabled {
+			scheme = "https"
+		}
+		slog.Info("Server starting", "url", scheme+"://"+cfg.Server.Host+":"+cfg.Server.Port)
 		if cfg.Prometheus.Enabled {
-			slog.Info("Prometheus metrics exposed", "url", "http://"+cfg.Server.Host+":"+cfg.Server.Port+cfg.Prometheus.Path)
+			slog.Info("Prometheus metrics exposed", "url", scheme+"://"+cfg.Server.Host+":"+cfg.Server.Port+cfg.Prometheus.Path)
 		}
 		if cfg.Auth.Enabled {
 			slog.Info("Authentication enabled", "mode", cfg.Auth.Mode, "user", cfg.Auth.Username)
 		}
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			serverErrCh <- err
+		var listenErr error
+		if cfg.Server.TLS.Enabled {
+			slog.Info("TLS enabled", "cert", cfg.Server.TLS.CertFile, "key", cfg.Server.TLS.KeyFile)
+			listenErr = srv.ListenAndServeTLS(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+		} else {
+			listenErr = srv.ListenAndServe()
+		}
+		if listenErr != nil && listenErr != http.ErrServerClosed {
+			serverErrCh <- listenErr
 		}
 	}()
 
@@ -172,11 +190,34 @@ func main() {
 
 func configureLogger(cfg *config.Config) {
 	handlerOpts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	var handler slog.Handler
-	if cfg != nil && (cfg.Logging.JSON || cfg.Features.StructuredLogs) {
-		handler = slog.NewJSONHandler(os.Stdout, handlerOpts)
+	useJSON := cfg != nil && (cfg.Logging.JSON || cfg.Features.StructuredLogs)
+
+	var writers []io.Writer
+	writers = append(writers, os.Stdout)
+
+	// Set up syslog writer if configured
+	if cfg != nil && cfg.Logging.Syslog.Enabled {
+		syslogWriter, err := config.NewSyslogWriter(cfg.Logging.Syslog)
+		if err != nil {
+			slog.Warn("Failed to initialize syslog writer", "error", err)
+		} else {
+			writers = append(writers, syslogWriter)
+			slog.Info("Syslog forwarding enabled", "address", cfg.Logging.Syslog.Address, "network", cfg.Logging.Syslog.Network)
+		}
+	}
+
+	var output io.Writer
+	if len(writers) > 1 {
+		output = io.MultiWriter(writers...)
 	} else {
-		handler = slog.NewTextHandler(os.Stdout, handlerOpts)
+		output = writers[0]
+	}
+
+	var handler slog.Handler
+	if useJSON {
+		handler = slog.NewJSONHandler(output, handlerOpts)
+	} else {
+		handler = slog.NewTextHandler(output, handlerOpts)
 	}
 	logger := slog.New(handler)
 	slog.SetDefault(logger)

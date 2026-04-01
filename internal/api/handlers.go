@@ -29,6 +29,17 @@ type notificationFeatureOverride struct {
 	Notifications bool `json:"notifications"`
 }
 
+type adHocNotificationRequest struct {
+	Recipients       json.RawMessage `json:"recipients,omitempty"`
+	EmailTo          json.RawMessage `json:"email_to,omitempty"`
+	Subject          string          `json:"subject"`
+	Message          string          `json:"message"`
+	Channels         []string        `json:"channels"`
+	WebhookURL       string          `json:"webhook_url"`
+	TelegramBotToken string          `json:"telegram_bot_token"`
+	TelegramChatID   string          `json:"telegram_chat_id"`
+}
+
 type Handler struct {
 	cfg       *config.Config
 	db        *db.DB
@@ -84,7 +95,7 @@ func (h *Handler) CreateDomain(c *gin.Context) {
 		return
 	}
 
-	dom, err := h.db.CreateDomain(in.Name, in.Tags, in.Metadata, in.CustomCAPEM, in.CheckMode, in.DNSServers, in.Interval, in.Port, in.FolderID)
+	dom, err := h.db.CreateDomain(in.Name, in.Tags, in.Metadata, in.SourceType, in.SourceRef, in.CustomCAPEM, in.CheckMode, in.DNSServers, in.Interval, in.Port, in.FolderID)
 	if err != nil {
 		if isDomainAlreadyExistsErr(err) {
 			c.JSON(http.StatusConflict, gin.H{"error": "domain already exists"})
@@ -95,7 +106,7 @@ func (h *Handler) CreateDomain(c *gin.Context) {
 	}
 
 	if in.HasEnabled && !in.Enabled {
-		if err := h.db.UpdateDomain(dom.ID, dom.Name, dom.Tags, dom.Metadata, dom.CustomCAPEM, dom.CheckMode, dom.DNSServers, false, dom.CheckInterval, dom.Port, dom.FolderID); err != nil {
+		if err := h.db.UpdateDomain(dom.ID, dom.Name, dom.Tags, dom.Metadata, dom.SourceType, dom.SourceRef, dom.CustomCAPEM, dom.CheckMode, dom.DNSServers, false, dom.CheckInterval, dom.Port, dom.FolderID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -194,6 +205,27 @@ func (h *Handler) UpdateDomain(c *gin.Context) {
 	if in.HasCustomCAPEM {
 		customCAPEM = in.CustomCAPEM
 	}
+	sourceType := current.SourceType
+	if in.HasSourceType {
+		sourceType = in.SourceType
+	}
+	sourceRef := db.CloneSourceRef(current.SourceRef)
+	if in.HasSourceRef {
+		sourceRef = db.CloneSourceRef(in.SourceRef)
+	}
+	sourceRef, err = db.ValidateAndNormalizeSourceRef(sourceType, sourceRef)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	newName = normalizeInventoryName(sourceType, newName)
+	if newName == "" {
+		newName = db.SourceDisplayName(sourceType, sourceRef)
+	}
+	if newName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
 	checkMode := current.CheckMode
 	if in.HasCheckMode {
 		checkMode = in.CheckMode
@@ -220,13 +252,15 @@ func (h *Handler) UpdateDomain(c *gin.Context) {
 	}
 
 	needsRecheck := newName != current.Name ||
+		sourceType != current.SourceType ||
+		!equalStringMaps(sourceRef, current.SourceRef) ||
 		checkMode != current.CheckMode ||
 		dnsServers != current.DNSServers ||
 		customCAPEM != current.CustomCAPEM ||
 		port != current.Port ||
 		(!current.Enabled && enabled)
 
-	if err := h.db.UpdateDomain(id, newName, tags, metadata, customCAPEM, checkMode, dnsServers, enabled, interval, port, folderID); err != nil {
+	if err := h.db.UpdateDomain(id, newName, tags, metadata, sourceType, sourceRef, customCAPEM, checkMode, dnsServers, enabled, interval, port, folderID); err != nil {
 		if isDomainAlreadyExistsErr(err) {
 			c.JSON(http.StatusConflict, gin.H{"error": "domain already exists"})
 			return
@@ -345,7 +379,7 @@ func (h *Handler) ImportDomains(c *gin.Context) {
 				continue
 			}
 
-			created, err := h.db.CreateDomain(preview.Name, preview.Tags, preview.Metadata, preview.CustomCAPEM, preview.CheckMode, preview.DNSServers, preview.CheckInterval, preview.Port, preview.FolderID)
+			created, err := h.db.CreateDomain(preview.Name, preview.Tags, preview.Metadata, preview.SourceType, preview.SourceRef, preview.CustomCAPEM, preview.CheckMode, preview.DNSServers, preview.CheckInterval, preview.Port, preview.FolderID)
 			if err != nil {
 				result.Action = "failed"
 				result.Error = err.Error()
@@ -355,7 +389,7 @@ func (h *Handler) ImportDomains(c *gin.Context) {
 			}
 
 			if !preview.Enabled {
-				if err := h.db.UpdateDomain(created.ID, created.Name, created.Tags, created.Metadata, created.CustomCAPEM, created.CheckMode, created.DNSServers, false, created.CheckInterval, created.Port, created.FolderID); err != nil {
+				if err := h.db.UpdateDomain(created.ID, created.Name, created.Tags, created.Metadata, created.SourceType, created.SourceRef, created.CustomCAPEM, created.CheckMode, created.DNSServers, false, created.CheckInterval, created.Port, created.FolderID); err != nil {
 					result.Action = "failed"
 					result.Error = err.Error()
 					resp.Summary.Failed++
@@ -409,7 +443,7 @@ func (h *Handler) ImportDomains(c *gin.Context) {
 			continue
 		}
 
-		if err := h.db.UpdateDomain(current.ID, preview.Name, preview.Tags, preview.Metadata, preview.CustomCAPEM, preview.CheckMode, preview.DNSServers, preview.Enabled, preview.CheckInterval, preview.Port, preview.FolderID); err != nil {
+		if err := h.db.UpdateDomain(current.ID, preview.Name, preview.Tags, preview.Metadata, preview.SourceType, preview.SourceRef, preview.CustomCAPEM, preview.CheckMode, preview.DNSServers, preview.Enabled, preview.CheckInterval, preview.Port, preview.FolderID); err != nil {
 			result.Action = "failed"
 			result.Error = err.Error()
 			resp.Summary.Failed++
@@ -551,6 +585,250 @@ func (h *Handler) TriggerCheck(c *gin.Context) {
 		"domain_id":       dom.ID,
 		"name":            dom.Name,
 	})
+}
+
+// POST /api/domains/:id/notify
+func (h *Handler) SendAdHocNotification(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+
+	dom, err := h.db.GetDomainByID(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if dom == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+
+	var req adHocNotificationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	recipients, recipientsSet, err := parseOptionalStringListJSON(req.Recipients, "recipients")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	emailRecipientsSet := recipientsSet
+	if emailTo, set, err := parseOptionalStringListJSON(req.EmailTo, "email_to"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	} else if set {
+		recipients = emailTo
+		emailRecipientsSet = true
+	}
+
+	channels, err := normalizeNotificationChannels(req.Channels)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	lastCheck, _ := h.db.GetLastCheck(id)
+
+	cfg := h.cfg.Snapshot()
+	if !cfg.Features.Notifications {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "notifications feature is not enabled"})
+		return
+	}
+
+	// Build the notification message
+	message := strings.TrimSpace(req.Message)
+	if message == "" && lastCheck != nil {
+		message = checker.BuildAdHocMessage(dom.Name, lastCheck)
+	} else if message == "" {
+		message = fmt.Sprintf("Ad-hoc notification for domain %s", dom.Name)
+	}
+
+	subject := strings.TrimSpace(req.Subject)
+	if subject == "" {
+		prefix := strings.TrimSpace(cfg.Notifications.Email.SubjectPrefix)
+		if prefix == "" {
+			prefix = "[SSL Domain Exporter]"
+		}
+		status := "unknown"
+		if lastCheck != nil {
+			status = lastCheck.OverallStatus
+		}
+		subject = fmt.Sprintf("%s Ad-hoc alert: %s (status: %s)", prefix, dom.Name, strings.ToUpper(status))
+	}
+
+	results := make([]gin.H, 0)
+
+	// Determine which channels to send to
+	if len(channels) == 0 {
+		channels = defaultAdHocNotificationChannels(cfg, req, recipients, emailRecipientsSet)
+	}
+	if len(channels) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no notification channels are configured for this request"})
+		return
+	}
+
+	timeout := checker.NotificationTimeoutFromConfig(cfg)
+
+	for _, ch := range channels {
+		switch ch {
+		case "email":
+			emailCfg := cfg.Notifications.Email
+			channelRecipients := recipients
+			if len(channelRecipients) == 0 {
+				channelRecipients = compactStrings(emailCfg.To)
+			}
+			emailCfg.To = channelRecipients
+			if strings.TrimSpace(emailCfg.Host) == "" || emailCfg.Port <= 0 || len(channelRecipients) == 0 {
+				results = append(results, gin.H{"channel": "email", "success": false, "error": "email not configured or no recipients"})
+				continue
+			}
+			err := checker.SendEmailDirect(emailCfg, subject, message, timeout)
+			entry := gin.H{"channel": "email", "success": err == nil, "recipients": channelRecipients}
+			if err != nil {
+				entry["error"] = err.Error()
+			}
+			results = append(results, entry)
+
+		case "webhook":
+			webhookURL := strings.TrimSpace(req.WebhookURL)
+			if webhookURL == "" {
+				webhookURL = strings.TrimSpace(cfg.Notifications.Webhook.URL)
+			}
+			if webhookURL == "" {
+				results = append(results, gin.H{"channel": "webhook", "success": false, "error": "webhook not configured"})
+				continue
+			}
+			err := checker.SendWebhookDirect(webhookURL, message, timeout)
+			entry := gin.H{"channel": "webhook", "success": err == nil}
+			if err != nil {
+				entry["error"] = err.Error()
+			}
+			results = append(results, entry)
+
+		case "telegram":
+			botToken := strings.TrimSpace(req.TelegramBotToken)
+			if botToken == "" {
+				botToken = strings.TrimSpace(cfg.Notifications.Telegram.BotToken)
+			}
+			chatID := strings.TrimSpace(req.TelegramChatID)
+			if chatID == "" {
+				chatID = strings.TrimSpace(cfg.Notifications.Telegram.ChatID)
+			}
+			if botToken == "" || chatID == "" {
+				results = append(results, gin.H{"channel": "telegram", "success": false, "error": "telegram not configured"})
+				continue
+			}
+			err := checker.SendTelegramDirect(botToken, chatID, message, timeout)
+			entry := gin.H{"channel": "telegram", "success": err == nil}
+			if err != nil {
+				entry["error"] = err.Error()
+			}
+			results = append(results, entry)
+		}
+	}
+
+	h.audit(c, "notify", "domain", &dom.ID, "Sent ad-hoc notification", map[string]any{
+		"domain":     dom.Name,
+		"channels":   channels,
+		"recipients": recipients,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"domain":  dom.Name,
+		"results": results,
+	})
+}
+
+func parseOptionalStringListJSON(raw json.RawMessage, field string) ([]string, bool, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, false, nil
+	}
+
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		return compactStrings([]string{one}), true, nil
+	}
+
+	var many []string
+	if err := json.Unmarshal(raw, &many); err == nil {
+		return compactStrings(many), true, nil
+	}
+
+	return nil, false, fmt.Errorf("%s must be a string or an array of strings", field)
+}
+
+func normalizeNotificationChannels(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		channel := strings.ToLower(strings.TrimSpace(value))
+		switch channel {
+		case "email", "webhook", "telegram":
+		case "":
+			continue
+		default:
+			return nil, fmt.Errorf("channels must only contain email, webhook, or telegram")
+		}
+		if _, ok := seen[channel]; ok {
+			continue
+		}
+		seen[channel] = struct{}{}
+		normalized = append(normalized, channel)
+	}
+	return normalized, nil
+}
+
+func defaultAdHocNotificationChannels(cfg *config.Config, req adHocNotificationRequest, recipients []string, recipientsSet bool) []string {
+	channels := make([]string, 0, 3)
+	if cfg == nil {
+		return channels
+	}
+
+	emailRecipients := recipients
+	if !recipientsSet && len(emailRecipients) == 0 {
+		emailRecipients = compactStrings(cfg.Notifications.Email.To)
+	}
+	if (cfg.Notifications.Email.Enabled || recipientsSet) &&
+		strings.TrimSpace(cfg.Notifications.Email.Host) != "" &&
+		cfg.Notifications.Email.Port > 0 &&
+		len(emailRecipients) > 0 {
+		channels = append(channels, "email")
+	}
+
+	if webhookURL := strings.TrimSpace(req.WebhookURL); webhookURL != "" || (cfg.Notifications.Webhook.Enabled && strings.TrimSpace(cfg.Notifications.Webhook.URL) != "") {
+		channels = append(channels, "webhook")
+	}
+
+	botToken := strings.TrimSpace(req.TelegramBotToken)
+	chatID := strings.TrimSpace(req.TelegramChatID)
+	if (botToken != "" && chatID != "") ||
+		(cfg.Notifications.Telegram.Enabled &&
+			strings.TrimSpace(cfg.Notifications.Telegram.BotToken) != "" &&
+			strings.TrimSpace(cfg.Notifications.Telegram.ChatID) != "") {
+		channels = append(channels, "telegram")
+	}
+
+	return channels
+}
+
+func compactStrings(values []string) []string {
+	compacted := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			compacted = append(compacted, value)
+		}
+	}
+	return compacted
 }
 
 // GET /api/folders
@@ -766,7 +1044,7 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 	defer w.Flush()
 
 	header := []string{
-		"id", "domain", "port", "folder_id", "tags", "metadata", "custom_ca", "check_mode", "dns_servers", "enabled", "status",
+		"id", "domain", "port", "folder_id", "tags", "metadata", "source_type", "source_ref", "custom_ca", "check_mode", "dns_servers", "enabled", "status",
 		"ssl_expiry_days", "domain_expiry_days", "registration_check_skipped",
 		"http_status_code", "http_response_time_ms", "http_redirects_https", "http_hsts_enabled", "checked_at",
 	}
@@ -783,6 +1061,8 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 			"",
 			db.JoinTags(d.Tags),
 			marshalMetadataCSV(d.Metadata),
+			d.EffectiveSourceType(),
+			db.SourceRefSearchText(d.SourceRef),
 			strconv.FormatBool(strings.TrimSpace(d.CustomCAPEM) != ""),
 			d.EffectiveCheckMode(),
 			d.DNSServers,
@@ -801,24 +1081,24 @@ func (h *Handler) ExportDomainsCSV(c *gin.Context) {
 			row[3] = strconv.FormatInt(*d.FolderID, 10)
 		}
 		if chk := d.LastCheck; chk != nil {
-			row[10] = chk.OverallStatus
+			row[12] = chk.OverallStatus
 			if chk.SSLExpiryDays != nil {
-				row[11] = strconv.Itoa(*chk.SSLExpiryDays)
+				row[13] = strconv.Itoa(*chk.SSLExpiryDays)
 			}
 			if chk.RegistrationCheckSkipped {
-				row[12] = "N/A"
-				row[13] = "true"
+				row[14] = "N/A"
+				row[15] = "true"
 			} else {
 				if chk.DomainExpiryDays != nil {
-					row[12] = strconv.Itoa(*chk.DomainExpiryDays)
+					row[14] = strconv.Itoa(*chk.DomainExpiryDays)
 				}
-				row[13] = "false"
+				row[15] = "false"
 			}
-			row[14] = strconv.Itoa(chk.HTTPStatusCode)
-			row[15] = strconv.FormatInt(chk.HTTPResponseTimeMs, 10)
-			row[16] = strconv.FormatBool(chk.HTTPRedirectsHTTPS)
-			row[17] = strconv.FormatBool(chk.HTTPHSTSEnabled)
-			row[18] = chk.CheckedAt.Format("2006-01-02 15:04:05")
+			row[16] = strconv.Itoa(chk.HTTPStatusCode)
+			row[17] = strconv.FormatInt(chk.HTTPResponseTimeMs, 10)
+			row[18] = strconv.FormatBool(chk.HTTPRedirectsHTTPS)
+			row[19] = strconv.FormatBool(chk.HTTPHSTSEnabled)
+			row[20] = chk.CheckedAt.Format("2006-01-02 15:04:05")
 		}
 		for _, field := range exportFields {
 			row = append(row, d.Metadata[field.Key])
@@ -924,6 +1204,86 @@ func (h *Handler) TestNotifications(c *gin.Context) {
 		results = []checker.TestResult{}
 	}
 	c.JSON(http.StatusOK, results)
+}
+
+// GET /api/k8s/certificates
+func (h *Handler) ScanK8SCertificates(c *gin.Context) {
+	cfg := h.cfg.Snapshot()
+	if !cfg.Kubernetes.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kubernetes monitoring is not enabled"})
+		return
+	}
+
+	k8sCfg := checker.K8SConfig{
+		Enabled:            cfg.Kubernetes.Enabled,
+		APIServer:          cfg.Kubernetes.APIServer,
+		Token:              cfg.Kubernetes.Token,
+		TokenFile:          cfg.Kubernetes.TokenFile,
+		Namespace:          cfg.Kubernetes.Namespace,
+		LabelSelector:      cfg.Kubernetes.LabelSelector,
+		InsecureSkipVerify: cfg.Kubernetes.InsecureSkipVerify,
+		CACertFile:         cfg.Kubernetes.CACertFile,
+	}
+
+	warningDays := cfg.Alerts.SSLExpiryWarningDays
+	result, err := checker.ScanK8SCertificates(k8sCfg, warningDays)
+	if err != nil && result == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GET /api/f5/certificates
+func (h *Handler) ScanF5Certificates(c *gin.Context) {
+	cfg := h.cfg.Snapshot()
+	if !cfg.F5.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "F5 monitoring is not enabled"})
+		return
+	}
+
+	f5Cfg := checker.F5Config{
+		Enabled:            cfg.F5.Enabled,
+		Host:               cfg.F5.Host,
+		Username:           cfg.F5.Username,
+		Password:           cfg.F5.Password,
+		InsecureSkipVerify: cfg.F5.InsecureSkipVerify,
+		Partition:          cfg.F5.Partition,
+	}
+
+	warningDays := cfg.Alerts.SSLExpiryWarningDays
+	result, err := checker.ScanF5Certificates(f5Cfg, warningDays)
+	if err != nil && result == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// POST /api/syslog/test
+func (h *Handler) TestSyslog(c *gin.Context) {
+	cfg := h.cfg.Snapshot()
+
+	testCfg := cfg.Logging.Syslog
+	// Allow overriding syslog settings from the request body for pre-save testing
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&testCfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	if !testCfg.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "syslog is not enabled in the provided configuration"})
+		return
+	}
+
+	if err := config.TestSyslog(testCfg); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "success": false})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Test syslog message sent successfully"})
 }
 
 // GET /api/settings (compatibility endpoint)
@@ -1217,7 +1577,7 @@ func (h *Handler) GetSummary(c *gin.Context) {
 
 	lastChecks, _ := h.db.GetAllLastChecks()
 
-	summary := map[string]int{
+	counts := map[string]int{
 		"total":    len(domains),
 		"ok":       0,
 		"warning":  0,
@@ -1226,15 +1586,40 @@ func (h *Handler) GetSummary(c *gin.Context) {
 		"unknown":  0,
 	}
 
+	errorDomains := make([]gin.H, 0)
+
 	for _, dom := range domains {
 		if chk, ok := lastChecks[dom.ID]; ok {
-			summary[normalizeSummaryStatus(chk.OverallStatus)]++
+			status := normalizeSummaryStatus(chk.OverallStatus)
+			counts[status]++
+			if status == "error" {
+				entry := gin.H{
+					"id":     dom.ID,
+					"name":   dom.Name,
+					"reason": chk.PrimaryReasonText,
+				}
+				if chk.SSLCheckError != "" {
+					entry["ssl_error"] = chk.SSLCheckError
+				}
+				if chk.DomainCheckError != "" {
+					entry["domain_error"] = chk.DomainCheckError
+				}
+				errorDomains = append(errorDomains, entry)
+			}
 		} else {
-			summary["unknown"]++
+			counts["unknown"]++
 		}
 	}
 
-	c.JSON(http.StatusOK, summary)
+	c.JSON(http.StatusOK, gin.H{
+		"total":         counts["total"],
+		"ok":            counts["ok"],
+		"warning":       counts["warning"],
+		"critical":      counts["critical"],
+		"error":         counts["error"],
+		"unknown":       counts["unknown"],
+		"error_domains": errorDomains,
+	})
 }
 
 func normalizeDomain(name string) string {
@@ -1300,6 +1685,8 @@ func buildImportedDomain(cfg *config.Config, current *db.Domain, in domainInput)
 		out.Enabled = true
 		out.Port = 443
 		out.CheckInterval = 21600
+		out.SourceType = db.DomainSourceManual
+		out.SourceRef = map[string]string{}
 		out.CheckMode = config.ValidateCheckMode(cfg.Domains.DefaultCheckMode)
 	}
 
@@ -1314,6 +1701,12 @@ func buildImportedDomain(cfg *config.Config, current *db.Domain, in domainInput)
 	}
 	if in.HasCustomCAPEM {
 		out.CustomCAPEM = in.CustomCAPEM
+	}
+	if in.HasSourceType {
+		out.SourceType = in.SourceType
+	}
+	if in.HasSourceRef {
+		out.SourceRef = db.CloneSourceRef(in.SourceRef)
 	}
 	if in.HasCheckMode {
 		out.CheckMode = in.CheckMode
@@ -1343,6 +1736,14 @@ func buildImportedDomain(cfg *config.Config, current *db.Domain, in domainInput)
 	}
 	if out.CheckInterval <= 0 {
 		out.CheckInterval = 21600
+	}
+	out.SourceType = db.NormalizeSourceType(out.SourceType)
+	if normalizedSourceRef, err := db.ValidateAndNormalizeSourceRef(out.SourceType, out.SourceRef); err == nil {
+		out.SourceRef = normalizedSourceRef
+	}
+	out.Name = normalizeInventoryName(out.SourceType, out.Name)
+	if out.Name == "" {
+		out.Name = db.SourceDisplayName(out.SourceType, out.SourceRef)
 	}
 	out.CheckMode = config.ValidateCheckMode(out.CheckMode)
 
@@ -1375,8 +1776,21 @@ func cloneDomain(src *db.Domain) *db.Domain {
 	out := *src
 	out.Tags = append([]string(nil), src.Tags...)
 	out.Metadata = cloneMetadata(src.Metadata)
+	out.SourceRef = db.CloneSourceRef(src.SourceRef)
 	out.FolderID = cloneFolderID(src.FolderID)
 	return &out
+}
+
+func equalStringMaps(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func marshalMetadataCSV(metadata map[string]string) string {

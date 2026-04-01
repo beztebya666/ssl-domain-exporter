@@ -26,6 +26,8 @@ type Domain struct {
 	CheckInterval int               `json:"check_interval"` // seconds
 	Tags          []string          `json:"tags"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
+	SourceType    string            `json:"source_type"`
+	SourceRef     map[string]string `json:"source_ref,omitempty"`
 	FolderID      *int64            `json:"folder_id,omitempty"`
 	SortOrder     int               `json:"sort_order"`
 	CustomCAPEM   string            `json:"custom_ca_pem"`
@@ -44,9 +46,20 @@ func (d *Domain) EffectiveCheckMode() string {
 	return "full"
 }
 
+func (d *Domain) EffectiveSourceType() string {
+	if d == nil {
+		return DomainSourceManual
+	}
+	return NormalizeSourceType(d.SourceType)
+}
+
+func (d *Domain) UsesManualEndpoint() bool {
+	return d.EffectiveSourceType() == DomainSourceManual
+}
+
 // RegistrationCheckEnabled returns true when RDAP/WHOIS should be performed.
 func (d *Domain) RegistrationCheckEnabled() bool {
-	return d.EffectiveCheckMode() == "full"
+	return d.UsesManualEndpoint() && d.EffectiveCheckMode() == "full"
 }
 
 // ParseDNSServers returns the per-domain DNS servers as a slice.
@@ -213,6 +226,8 @@ func (d *DB) Migrate() error {
 			tags TEXT DEFAULT '',
 			tags_json TEXT DEFAULT '[]',
 			metadata_json TEXT DEFAULT '{}',
+			source_type TEXT DEFAULT 'manual',
+			source_ref_json TEXT DEFAULT '{}',
 			folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
 			sort_order INTEGER DEFAULT 0,
 			custom_ca_pem TEXT DEFAULT '',
@@ -385,6 +400,12 @@ func (d *DB) Migrate() error {
 	if err := d.addColumnIfMissing("domains", "metadata_json", "TEXT DEFAULT '{}'"); err != nil {
 		return err
 	}
+	if err := d.addColumnIfMissing("domains", "source_type", "TEXT DEFAULT 'manual'"); err != nil {
+		return err
+	}
+	if err := d.addColumnIfMissing("domains", "source_ref_json", "TEXT DEFAULT '{}'"); err != nil {
+		return err
+	}
 	if err := d.addColumnIfMissing("domains", "check_mode", "TEXT DEFAULT 'full'"); err != nil {
 		return err
 	}
@@ -466,7 +487,7 @@ func (d *DB) Migrate() error {
 
 // ---- Domain CRUD ----
 
-const domainSelectCols = `id, name, port, enabled, check_interval, tags, tags_json, metadata_json, folder_id, sort_order, custom_ca_pem, check_mode, dns_servers, created_at, updated_at`
+const domainSelectCols = `id, name, port, enabled, check_interval, tags, tags_json, metadata_json, source_type, source_ref_json, folder_id, sort_order, custom_ca_pem, check_mode, dns_servers, created_at, updated_at`
 
 func (d *DB) GetDomains() ([]Domain, error) {
 	rows, err := d.sql.Query(`SELECT ` + domainSelectCols + ` FROM domains ORDER BY sort_order ASC, name ASC`)
@@ -480,21 +501,21 @@ func (d *DB) GetDomains() ([]Domain, error) {
 func (d *DB) GetDomainByID(id int64) (*Domain, error) {
 	var dom Domain
 	var folderID sql.NullInt64
-	var tagsRaw, tagsJSON, metadataJSON string
+	var tagsRaw, tagsJSON, metadataJSON, sourceRefJSON string
 	err := d.sql.QueryRow(`SELECT `+domainSelectCols+` FROM domains WHERE id = ?`, id).
 		Scan(&dom.ID, &dom.Name, &dom.Port, &dom.Enabled, &dom.CheckInterval,
-			&tagsRaw, &tagsJSON, &metadataJSON, &folderID, &dom.SortOrder, &dom.CustomCAPEM, &dom.CheckMode, &dom.DNSServers, &dom.CreatedAt, &dom.UpdatedAt)
+			&tagsRaw, &tagsJSON, &metadataJSON, &dom.SourceType, &sourceRefJSON, &folderID, &dom.SortOrder, &dom.CustomCAPEM, &dom.CheckMode, &dom.DNSServers, &dom.CreatedAt, &dom.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	normalizeDomainRow(&dom, tagsRaw, tagsJSON, metadataJSON, folderID)
+	normalizeDomainRow(&dom, tagsRaw, tagsJSON, metadataJSON, sourceRefJSON, folderID)
 	return &dom, nil
 }
 
-func (d *DB) CreateDomain(name string, tags []string, metadata map[string]string, customCAPEM, checkMode, dnsServers string, interval int, port int, folderID *int64) (*Domain, error) {
+func (d *DB) CreateDomain(name string, tags []string, metadata map[string]string, sourceType string, sourceRef map[string]string, customCAPEM, checkMode, dnsServers string, interval int, port int, folderID *int64) (*Domain, error) {
 	if interval == 0 {
 		interval = 21600
 	}
@@ -504,9 +525,14 @@ func (d *DB) CreateDomain(name string, tags []string, metadata map[string]string
 	if checkMode == "" {
 		checkMode = "full"
 	}
+	sourceType = NormalizeSourceType(sourceType)
 	tags = NormalizeTags(tags)
 	tagsText := JoinTags(tags)
 	metadata, err := ValidateAndNormalizeMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	sourceRef, err = ValidateAndNormalizeSourceRef(sourceType, sourceRef)
 	if err != nil {
 		return nil, err
 	}
@@ -518,15 +544,19 @@ func (d *DB) CreateDomain(name string, tags []string, metadata map[string]string
 	if err != nil {
 		return nil, fmt.Errorf("marshal domain metadata json: %w", err)
 	}
+	sourceRefJSON, err := json.Marshal(sourceRef)
+	if err != nil {
+		return nil, fmt.Errorf("marshal domain source_ref json: %w", err)
+	}
 	sortOrder, err := d.nextDomainSortOrder()
 	if err != nil {
 		return nil, err
 	}
 
 	res, err := d.sql.Exec(`
-		INSERT INTO domains (name, port, tags, tags_json, metadata_json, folder_id, sort_order, custom_ca_pem, check_mode, dns_servers, check_interval)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		name, port, tagsText, string(tagsJSON), string(metadataJSON), folderID, sortOrder, customCAPEM, checkMode, dnsServers, interval)
+		INSERT INTO domains (name, port, tags, tags_json, metadata_json, source_type, source_ref_json, folder_id, sort_order, custom_ca_pem, check_mode, dns_servers, check_interval)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		name, port, tagsText, string(tagsJSON), string(metadataJSON), sourceType, string(sourceRefJSON), folderID, sortOrder, customCAPEM, checkMode, dnsServers, interval)
 	if err != nil {
 		return nil, err
 	}
@@ -534,16 +564,21 @@ func (d *DB) CreateDomain(name string, tags []string, metadata map[string]string
 	return d.GetDomainByID(id)
 }
 
-func (d *DB) UpdateDomain(id int64, name string, tags []string, metadata map[string]string, customCAPEM, checkMode, dnsServers string, enabled bool, interval int, port int, folderID *int64) error {
+func (d *DB) UpdateDomain(id int64, name string, tags []string, metadata map[string]string, sourceType string, sourceRef map[string]string, customCAPEM, checkMode, dnsServers string, enabled bool, interval int, port int, folderID *int64) error {
 	if port <= 0 {
 		port = 443
 	}
 	if checkMode == "" {
 		checkMode = "full"
 	}
+	sourceType = NormalizeSourceType(sourceType)
 	tags = NormalizeTags(tags)
 	tagsText := JoinTags(tags)
 	metadata, err := ValidateAndNormalizeMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	sourceRef, err = ValidateAndNormalizeSourceRef(sourceType, sourceRef)
 	if err != nil {
 		return err
 	}
@@ -555,9 +590,13 @@ func (d *DB) UpdateDomain(id int64, name string, tags []string, metadata map[str
 	if err != nil {
 		return fmt.Errorf("marshal domain metadata json: %w", err)
 	}
+	sourceRefJSON, err := json.Marshal(sourceRef)
+	if err != nil {
+		return fmt.Errorf("marshal domain source_ref json: %w", err)
+	}
 	_, err = d.sql.Exec(`
-		UPDATE domains SET name=?, port=?, tags=?, tags_json=?, metadata_json=?, folder_id=?, custom_ca_pem=?, check_mode=?, dns_servers=?, enabled=?, check_interval=?, updated_at=CURRENT_TIMESTAMP
-		WHERE id=?`, name, port, tagsText, string(tagsJSON), string(metadataJSON), folderID, customCAPEM, checkMode, dnsServers, enabled, interval, id)
+		UPDATE domains SET name=?, port=?, tags=?, tags_json=?, metadata_json=?, source_type=?, source_ref_json=?, folder_id=?, custom_ca_pem=?, check_mode=?, dns_servers=?, enabled=?, check_interval=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=?`, name, port, tagsText, string(tagsJSON), string(metadataJSON), sourceType, string(sourceRefJSON), folderID, customCAPEM, checkMode, dnsServers, enabled, interval, id)
 	return err
 }
 
@@ -940,24 +979,25 @@ func scanDomainRows(rows *sql.Rows) ([]Domain, error) {
 	for rows.Next() {
 		var dom Domain
 		var folderID sql.NullInt64
-		var tagsRaw, tagsJSON, metadataJSON string
+		var tagsRaw, tagsJSON, metadataJSON, sourceRefJSON string
 		if err := rows.Scan(&dom.ID, &dom.Name, &dom.Port, &dom.Enabled, &dom.CheckInterval,
-			&tagsRaw, &tagsJSON, &metadataJSON, &folderID, &dom.SortOrder, &dom.CustomCAPEM, &dom.CheckMode, &dom.DNSServers, &dom.CreatedAt, &dom.UpdatedAt); err != nil {
+			&tagsRaw, &tagsJSON, &metadataJSON, &dom.SourceType, &sourceRefJSON, &folderID, &dom.SortOrder, &dom.CustomCAPEM, &dom.CheckMode, &dom.DNSServers, &dom.CreatedAt, &dom.UpdatedAt); err != nil {
 			return nil, err
 		}
-		normalizeDomainRow(&dom, tagsRaw, tagsJSON, metadataJSON, folderID)
+		normalizeDomainRow(&dom, tagsRaw, tagsJSON, metadataJSON, sourceRefJSON, folderID)
 		domains = append(domains, dom)
 	}
 	return domains, rows.Err()
 }
 
-func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, folderID sql.NullInt64) {
+func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON, sourceRefJSON string, folderID sql.NullInt64) {
 	if dom.Port <= 0 {
 		dom.Port = 443
 	}
 	if dom.CheckMode == "" {
 		dom.CheckMode = "full"
 	}
+	dom.SourceType = NormalizeSourceType(dom.SourceType)
 	if strings.TrimSpace(tagsJSON) != "" {
 		if err := json.Unmarshal([]byte(tagsJSON), &dom.Tags); err != nil {
 			slog.Warn("DB failed to parse tags_json", "domain", dom.Name, "error", err)
@@ -975,6 +1015,11 @@ func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, fol
 			slog.Warn("DB failed to parse metadata_json", "domain", dom.Name, "error", err)
 		}
 	}
+	if strings.TrimSpace(sourceRefJSON) != "" {
+		if err := json.Unmarshal([]byte(sourceRefJSON), &dom.SourceRef); err != nil {
+			slog.Warn("DB failed to parse source_ref_json", "domain", dom.Name, "error", err)
+		}
+	}
 	if dom.Metadata != nil {
 		if normalized, err := ValidateAndNormalizeMetadata(dom.Metadata); err == nil {
 			dom.Metadata = normalized
@@ -982,6 +1027,12 @@ func normalizeDomainRow(dom *Domain, tagsRaw, tagsJSON, metadataJSON string, fol
 	}
 	if dom.Metadata == nil {
 		dom.Metadata = map[string]string{}
+	}
+	if normalizedSourceRef, err := ValidateAndNormalizeSourceRef(dom.SourceType, dom.SourceRef); err == nil {
+		dom.SourceRef = normalizedSourceRef
+	}
+	if dom.SourceRef == nil {
+		dom.SourceRef = map[string]string{}
 	}
 	if folderID.Valid {
 		v := folderID.Int64

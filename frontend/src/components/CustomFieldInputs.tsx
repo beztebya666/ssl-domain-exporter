@@ -58,11 +58,21 @@ function renderFieldInput(field: CustomField, value: string, onChange: (value: s
     case 'email':
     case 'url':
     case 'date':
+    case 'number':
       return (
         <input
           {...common}
           type={field.type}
           placeholder={field.placeholder || field.label}
+        />
+      )
+    case 'ip_address':
+      return (
+        <input
+          {...common}
+          type="text"
+          placeholder={field.placeholder || 'e.g. 192.168.1.1'}
+          pattern="[0-9a-fA-F.:]*"
         />
       )
     case 'select':

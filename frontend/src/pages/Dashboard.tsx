@@ -202,8 +202,22 @@ export default function Dashboard({ bootstrap }: DashboardProps) {
 
   const operationalAlerts = domains.filter(domain => {
     const status = domain.last_check?.overall_status
-    return status === 'warning' || status === 'critical' || status === 'error'
+    return status === 'warning' || status === 'critical'
   })
+  const errorDomains = useMemo(() => {
+    if (hasActiveFilters) {
+      return domains
+        .filter(domain => domain.last_check?.overall_status === 'error')
+        .map(domain => ({
+          id: domain.id,
+          name: domain.name,
+          reason: primaryReason(domain) || 'Check failed',
+          ssl_error: domain.last_check?.ssl_check_error,
+          domain_error: domain.last_check?.domain_check_error,
+        }))
+    }
+    return summary?.error_domains ?? []
+  }, [domains, hasActiveFilters, summary?.error_domains])
 
   const validationFindings = domains.filter(hasAdvisoryFindings)
 
@@ -250,8 +264,8 @@ export default function Dashboard({ bootstrap }: DashboardProps) {
     return (
       <div className="space-y-6 p-6">
         <PageHeadingSkeleton />
-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-          {Array.from({ length: 4 }).map((_, index) => (
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-5">
+          {Array.from({ length: 5 }).map((_, index) => (
             <StatCardSkeleton key={index} />
           ))}
         </div>
@@ -454,7 +468,7 @@ export default function Dashboard({ bootstrap }: DashboardProps) {
                         <input
                           id={`dashboard-filter-${field.key}`}
                           className="input"
-                          type={field.type === 'date' ? 'date' : field.type === 'email' ? 'email' : field.type === 'url' ? 'url' : 'text'}
+                          type={field.type === 'date' ? 'date' : field.type === 'email' ? 'email' : field.type === 'url' ? 'url' : field.type === 'number' ? 'number' : 'text'}
                           value={metadataFilters[field.key] ?? ''}
                           onChange={e => {
                             setMetadataFilters(current => updateFilter(current, field.key, e.target.value))
@@ -477,12 +491,49 @@ export default function Dashboard({ bootstrap }: DashboardProps) {
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-5">
         <SummaryCard label={hasActiveFilters ? 'Current Page' : 'Total Domains'} value={summaryData?.total ?? 0} icon={Globe} color="text-blue-400" total={Math.max(summaryData?.total ?? 0, 1)} />
         <SummaryCard label="Healthy" value={summaryData?.ok ?? 0} icon={CheckCircle} color="text-green-400" total={totalForCards} />
         <SummaryCard label="Warnings" value={summaryData?.warning ?? 0} icon={AlertTriangle} color="text-yellow-400" total={totalForCards} />
-        <SummaryCard label="Critical" value={(summaryData?.critical ?? 0) + (summaryData?.error ?? 0)} icon={XCircle} color="text-red-400" total={totalForCards} />
+        <SummaryCard label="Critical" value={summaryData?.critical ?? 0} icon={AlertTriangle} color="text-red-400" total={totalForCards} />
+        <SummaryCard label="Error" value={summaryData?.error ?? 0} icon={XCircle} color="text-rose-300" total={totalForCards} />
       </div>
+
+      {errorDomains.length > 0 && (
+        <div className="card space-y-3">
+          <h2 className="flex items-center gap-2 font-semibold text-white">
+            <XCircle size={16} className="text-rose-300" />
+            Error Domains
+            <span className="text-xs font-normal text-slate-500">{errorDomains.length}</span>
+          </h2>
+          <p className="text-xs text-slate-500">
+            Hard check failures tracked separately from warning and critical badge conditions.
+          </p>
+          {errorDomains.slice(0, 12).map(entry => (
+            <div
+              key={entry.id}
+              className="flex cursor-pointer items-start justify-between gap-4 rounded-lg bg-gray-800 p-3 transition-colors hover:bg-gray-750"
+              onClick={() => navigate(`/domains/${entry.id}`)}
+              onKeyDown={(event) => activateCardOnKey(event, () => navigate(`/domains/${entry.id}`))}
+              role="button"
+              tabIndex={0}
+              aria-label={`Open error details for ${entry.name}`}
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <StatusBadge status="error" title={entry.reason} />
+                  <div className="text-sm font-medium text-gray-200">{entry.name}</div>
+                </div>
+                <div className="mt-1 text-xs text-slate-400">{entry.reason}</div>
+              </div>
+              <div className="max-w-sm text-right text-xs text-slate-500">
+                {entry.ssl_error && <div>SSL: {entry.ssl_error}</div>}
+                {entry.domain_error && <div>Domain: {entry.domain_error}</div>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {operationalAlerts.length > 0 && (
         <div className="card space-y-3">

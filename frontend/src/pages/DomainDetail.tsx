@@ -2,10 +2,12 @@ import { lazy, Suspense, useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
+  BellRing,
   ArrowLeft, RefreshCw, Shield, Globe, Link2, Clock,
   CheckCircle, XCircle, AlertTriangle, ExternalLink, ChevronDown, ChevronUp, Pencil, Check, X, Server
 } from 'lucide-react'
-import { fetchDomain, fetchHistory, fetchHistoryPage, triggerCheck, updateDomain, fetchFolders, fetchCustomFields } from '../api/client'
+import { fetchDomain, fetchHistory, fetchHistoryPage, triggerCheck, updateDomain, fetchFolders, fetchCustomFields, sendAdHocNotification } from '../api/client'
+import AdHocNotificationModal from '../components/AdHocNotificationModal'
 import StatusBadge from '../components/StatusBadge'
 import TagEditor from '../components/TagEditor'
 import MetadataEditor from '../components/MetadataEditor'
@@ -16,9 +18,11 @@ import Pagination from '../components/Pagination'
 import { DetailSkeleton, Skeleton } from '../components/Skeleton'
 import { useToast } from '../components/ToastProvider'
 import { format, formatDistanceToNow } from 'date-fns'
-import type { AuthMe, BootstrapConfig, ChainCert } from '../types'
+import type { AdHocNotificationRequest, AdHocNotificationResult, AuthMe, BootstrapConfig, ChainCert } from '../types'
 import { metadataSearchText } from '../lib/domainFields'
 import { mergeSchemaAndExtraMetadata, splitMetadataBySchema, visibleMetadataSummary } from '../lib/customFields'
+import InventorySourceEditor from '../components/InventorySourceEditor'
+import { buildSourceRef, buildSourceWritePayload, createInventorySourceDraft, formatSourceSummary, isManualSource, sourceTypeBadge, sourceTypeLabel } from '../lib/domainSources'
 import { getErrorMessage } from '../lib/utils'
 
 const ExpiryHistoryChart = lazy(() => import('../components/ExpiryHistoryChart'))
@@ -82,7 +86,7 @@ type DomainDetailProps = {
   bootstrap?: BootstrapConfig
 }
 
-export default function DomainDetail({ me }: DomainDetailProps) {
+export default function DomainDetail({ me, bootstrap }: DomainDetailProps) {
   const { id } = useParams<{ id: string }>()
   const domainId = Number(id)
   const navigate = useNavigate()
@@ -90,7 +94,7 @@ export default function DomainDetail({ me }: DomainDetailProps) {
   const { showToast } = useToast()
   const [checking, setChecking] = useState(false)
   const [editing, setEditing] = useState(false)
-  const [editName, setEditName] = useState('')
+  const [editSourceDraft, setEditSourceDraft] = useState(() => createInventorySourceDraft())
   const [editTags, setEditTags] = useState<string[]>([])
   const [editMetadata, setEditMetadata] = useState<Record<string, string>>({})
   const [editEnabled, setEditEnabled] = useState(true)
@@ -101,7 +105,10 @@ export default function DomainDetail({ me }: DomainDetailProps) {
   const [editCheckMode, setEditCheckMode] = useState('full')
   const [editDnsServers, setEditDnsServers] = useState('')
   const [historyPage, setHistoryPage] = useState(1)
+  const [notifyOpen, setNotifyOpen] = useState(false)
+  const [notificationResults, setNotificationResults] = useState<AdHocNotificationResult[]>([])
   const canEdit = me?.can_edit ?? false
+  const notificationsEnabled = bootstrap?.features.notifications ?? true
 
   const { data: domain, isLoading } = useQuery({
     queryKey: ['domain', domainId],
@@ -141,9 +148,25 @@ export default function DomainDetail({ me }: DomainDetailProps) {
     onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to update domain.') }),
   })
 
+  const notifyMutation = useMutation({
+    mutationFn: (payload: AdHocNotificationRequest) => sendAdHocNotification(domainId, payload),
+    onSuccess: (response) => {
+      setNotificationResults(response.results ?? [])
+      qc.invalidateQueries({ queryKey: ['audit-logs'] })
+      const failures = (response.results ?? []).filter(result => !result.success)
+      showToast({
+        tone: failures.length > 0 ? 'error' : 'success',
+        text: failures.length > 0
+          ? 'Ad-hoc notification completed with channel failures. Review the delivery results.'
+          : 'Ad-hoc notification sent successfully.',
+      })
+    },
+    onError: (err: unknown) => showToast({ tone: 'error', text: getErrorMessage(err, 'Failed to send ad-hoc notification.') }),
+  })
+
   const startEdit = () => {
     if (!domain) return
-    setEditName(domain.name)
+    setEditSourceDraft(createInventorySourceDraft(domain))
     setEditTags(domain.tags)
     setEditMetadata(domain.metadata ?? {})
     setEditEnabled(domain.enabled)
@@ -154,6 +177,33 @@ export default function DomainDetail({ me }: DomainDetailProps) {
     setEditCheckMode(domain.check_mode || 'full')
     setEditDnsServers(domain.dns_servers || '')
     setEditing(true)
+  }
+
+  const saveEdit = () => {
+    const sourcePayload = buildSourceWritePayload(editSourceDraft)
+    if (sourcePayload.source_type === 'manual' && !sourcePayload.name?.trim()) {
+      showToast({ tone: 'error', text: 'Domain / host is required for manual endpoints.' })
+      return
+    }
+
+    updateMutation.mutate({
+      name: sourcePayload.name,
+      source_type: sourcePayload.source_type,
+      source_ref: sourcePayload.source_ref,
+      tags: editTags,
+      metadata: editMetadata,
+      enabled: editEnabled,
+      check_interval: editInterval,
+      folder_id: editFolderValue ? Number(editFolderValue) : null,
+      ...(sourcePayload.source_type === 'manual'
+        ? {
+            port: editPort,
+            custom_ca_pem: editCustomCAPEM,
+            check_mode: editCheckMode,
+            dns_servers: editDnsServers,
+          }
+        : {}),
+    })
   }
 
   const handleCheck = async () => {
@@ -175,6 +225,15 @@ export default function DomainDetail({ me }: DomainDetailProps) {
   }
 
   const isSSLOnly = domain?.check_mode === 'ssl_only'
+  const manualSource = isManualSource(domain?.source_type)
+  const sourceSummary = formatSourceSummary(domain?.source_type, domain?.source_ref)
+  const editingManualSource = editSourceDraft.sourceType === 'manual'
+  const editingPreviewName = buildSourceWritePayload(editSourceDraft).name || domain?.name || ''
+  const editingSourceSummary = formatSourceSummary(editSourceDraft.sourceType, buildSourceRef(editSourceDraft))
+  const activeManualSource = editing ? editingManualSource : manualSource
+  const activeSourceType = editing ? editSourceDraft.sourceType : domain?.source_type
+  const activeSourceSummary = editing ? editingSourceSummary : sourceSummary
+  const showDomainExpirySeries = manualSource && !isSSLOnly
   const editMetadataSplit = splitMetadataBySchema(editMetadata, customFields)
   const visibleDetailMetadata = visibleMetadataSummary(domain?.metadata ?? {}, customFields, 'details')
 
@@ -217,43 +276,33 @@ export default function DomainDetail({ me }: DomainDetailProps) {
 
   return (
     <div className="p-6 space-y-6">
+      <AdHocNotificationModal
+        open={notifyOpen}
+        domainName={domain.name}
+        busy={notifyMutation.isPending}
+        results={notificationResults}
+        onClose={() => {
+          if (notifyMutation.isPending) return
+          setNotifyOpen(false)
+        }}
+        onSubmit={(payload) => notifyMutation.mutate(payload)}
+      />
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <button className="btn-ghost p-2" onClick={() => navigate('/domains')}>
             <ArrowLeft size={16} />
           </button>
-          {editing ? (
-            <div className="flex items-center gap-2">
-              <input
-                className="input text-lg font-bold py-1 w-64"
-                value={editName}
-                onChange={e => setEditName(e.target.value)}
-              />
-              <button
-                className="btn-primary py-1"
-                onClick={() => updateMutation.mutate({
-                  name: editName,
-                  tags: editTags,
-                  metadata: editMetadata,
-                  enabled: editEnabled, check_interval: editInterval,
-                  port: editPort,
-                  folder_id: editFolderValue ? Number(editFolderValue) : null,
-                  custom_ca_pem: editCustomCAPEM,
-                  check_mode: editCheckMode,
-                  dns_servers: editDnsServers,
-                })}
-              >
-                <Check size={14} /> Save
-              </button>
-              <button className="btn-ghost py-1" onClick={() => setEditing(false)}>
-                <X size={14} />
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-3">
-              <h1 className="text-xl font-bold text-white">{domain.name}</h1>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-3">
+              <h1 className="text-xl font-bold text-white">{editing ? editingPreviewName : domain.name}</h1>
               <StatusBadge status={check?.overall_status ?? 'unknown'} title={check?.primary_reason_text} />
+              {!activeManualSource && (
+                <span className="rounded-full border border-cyan-500/20 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-300">
+                  {sourceTypeBadge(activeSourceType)}
+                </span>
+              )}
               {advisoryOnly && (
                 <span className="text-xs text-slate-300 bg-slate-500/10 border border-slate-600/40 px-2 py-0.5 rounded-full" title={check?.primary_reason_text}>
                   validation notes
@@ -264,21 +313,52 @@ export default function DomainDetail({ me }: DomainDetailProps) {
                   {tag}
                 </span>
               ))}
-              {domain.check_mode === 'ssl_only' && (
+              {manualSource && domain.check_mode === 'ssl_only' && (
                 <span className="text-xs text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-full">SSL Only</span>
               )}
-              {canEdit && (
-                <button className="btn-ghost p-1.5 opacity-60 hover:opacity-100" onClick={startEdit}>
-                  <Pencil size={13} />
-                </button>
-              )}
             </div>
-          )}
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <span>{sourceTypeLabel(activeSourceType)}</span>
+              {activeSourceSummary && <span>| {activeSourceSummary}</span>}
+            </div>
+          </div>
         </div>
         <div className="flex items-center gap-2">
-          <a href={`https://${domain.name}${domain.port && domain.port !== 443 ? `:${domain.port}` : ''}`} target="_blank" rel="noopener noreferrer" className="btn-ghost">
-            <ExternalLink size={14} /> Open
-          </a>
+          {activeManualSource && (
+            <a href={`https://${domain.name}${domain.port && domain.port !== 443 ? `:${domain.port}` : ''}`} target="_blank" rel="noopener noreferrer" className="btn-ghost">
+              <ExternalLink size={14} /> Open
+            </a>
+          )}
+          {canEdit && notificationsEnabled && (
+            <button
+              className="btn-ghost border border-slate-700"
+              onClick={() => {
+                setNotificationResults([])
+                setNotifyOpen(true)
+              }}
+            >
+              <BellRing size={14} />
+              Notify
+            </button>
+          )}
+          {canEdit && editing && (
+            <>
+              <button className="btn-primary" onClick={saveEdit} disabled={updateMutation.isPending}>
+                <Check size={14} />
+                {updateMutation.isPending ? 'Saving...' : 'Save'}
+              </button>
+              <button className="btn-ghost border border-slate-700" onClick={() => setEditing(false)} disabled={updateMutation.isPending}>
+                <X size={14} />
+                Cancel
+              </button>
+            </>
+          )}
+          {canEdit && !editing && (
+            <button className="btn-ghost border border-slate-700" onClick={startEdit}>
+              <Pencil size={13} />
+              Edit
+            </button>
+          )}
           {canEdit && (
             <button className="btn-primary" onClick={handleCheck} disabled={checking}>
               <RefreshCw size={14} className={checking ? 'animate-spin' : ''} />
@@ -292,10 +372,21 @@ export default function DomainDetail({ me }: DomainDetailProps) {
       {editing && (
         <div className="card space-y-4">
           <CollapsiblePanel
+            title="Source & identity"
+            description="Switch between a manual endpoint, Kubernetes TLS secret, or F5 BIG-IP certificate while keeping one inventory record."
+            icon={Globe}
+            defaultOpen
+            className="border-0 bg-transparent"
+            bodyClassName="px-0 pb-0"
+          >
+            <InventorySourceEditor draft={editSourceDraft} onChange={setEditSourceDraft} />
+          </CollapsiblePanel>
+
+          <CollapsiblePanel
             title="Inventory & ownership"
             description="Business context, tags, custom fields, and optional free-form metadata."
             icon={Server}
-            defaultOpen
+            defaultOpen={false}
             className="border-0 bg-transparent"
             bodyClassName="px-0 pb-0"
           >
@@ -319,7 +410,9 @@ export default function DomainDetail({ me }: DomainDetailProps) {
 
           <CollapsiblePanel
             title="Monitoring policy"
-            description="Scheduling, inventory placement, endpoint port, and registration lookup mode."
+            description={editingManualSource
+              ? 'Scheduling, inventory placement, endpoint port, and registration lookup mode.'
+              : 'Scheduling, enablement, and folder placement for source-backed certificate tracking.'}
             icon={Clock}
             defaultOpen
             className="border-0 bg-transparent"
@@ -338,10 +431,6 @@ export default function DomainDetail({ me }: DomainDetailProps) {
                 </select>
               </div>
               <div>
-                <label className="label">HTTPS Port</label>
-                <input className="input" type="number" min={1} max={65535} value={editPort} onChange={e => setEditPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))} />
-              </div>
-              <div>
                 <label className="label">Folder</label>
                 <select className="select" value={editFolderValue} onChange={e => setEditFolderValue(e.target.value)}>
                   <option value="">No folder</option>
@@ -350,36 +439,51 @@ export default function DomainDetail({ me }: DomainDetailProps) {
                   ))}
                 </select>
               </div>
-              <div>
-                <label className="label">Check Mode</label>
-                <select className="select" value={editCheckMode} onChange={e => setEditCheckMode(e.target.value)}>
-                  <option value="full">Full (SSL + Domain Registration)</option>
-                  <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
-                </select>
-              </div>
-              <div>
-                <label className="label">DNS Servers</label>
-                <input className="input" value={editDnsServers} onChange={e => setEditDnsServers(e.target.value)} placeholder="10.0.0.1:53, 10.0.0.2:53" />
-              </div>
+              {editingManualSource && (
+                <>
+                  <div>
+                    <label className="label">HTTPS Port</label>
+                    <input className="input" type="number" min={1} max={65535} value={editPort} onChange={e => setEditPort(Math.max(1, Math.min(65535, Number(e.target.value) || 443)))} />
+                  </div>
+                  <div>
+                    <label className="label">Check Mode</label>
+                    <select className="select" value={editCheckMode} onChange={e => setEditCheckMode(e.target.value)}>
+                      <option value="full">Full (SSL + Domain Registration)</option>
+                      <option value="ssl_only">SSL Only (skip RDAP/WHOIS)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="label">DNS Servers</label>
+                    <input className="input" value={editDnsServers} onChange={e => setEditDnsServers(e.target.value)} placeholder="10.0.0.1:53, 10.0.0.2:53" />
+                  </div>
+                </>
+              )}
             </div>
+            {!editingManualSource && (
+              <div className="mt-4 rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3 text-xs text-slate-400">
+                Source-backed inventory items do not use manual endpoint settings such as HTTPS port, per-domain DNS overrides, or RDAP/WHOIS mode.
+              </div>
+            )}
           </CollapsiblePanel>
 
-          <CollapsiblePanel
-            title="Trust & certificate overrides"
-            description="Optional private trust root used only for this inventory item."
-            icon={Shield}
-            defaultOpen={false}
-            className="border-0 bg-transparent"
-            bodyClassName="px-0 pb-0"
-          >
-            <label className="label">Custom Root CA (PEM)</label>
-            <textarea
-              className="input h-32 resize-y font-mono text-xs"
-              value={editCustomCAPEM}
-              onChange={e => setEditCustomCAPEM(e.target.value)}
-              placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
-            />
-          </CollapsiblePanel>
+          {editingManualSource && (
+            <CollapsiblePanel
+              title="Trust & certificate overrides"
+              description="Optional private trust root used only for this inventory item."
+              icon={Shield}
+              defaultOpen={false}
+              className="border-0 bg-transparent"
+              bodyClassName="px-0 pb-0"
+            >
+              <label className="label">Custom Root CA (PEM)</label>
+              <textarea
+                className="input h-32 resize-y font-mono text-xs"
+                value={editCustomCAPEM}
+                onChange={e => setEditCustomCAPEM(e.target.value)}
+                placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+              />
+            </CollapsiblePanel>
+          )}
         </div>
       )}
 
@@ -485,12 +589,21 @@ export default function DomainDetail({ me }: DomainDetailProps) {
         {/* Domain Panel */}
         <div className="card space-y-0">
           <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
-            <Globe size={15} className="text-green-400" /> Domain Registration
+            {manualSource ? <Globe size={15} className="text-green-400" /> : <Server size={15} className="text-cyan-400" />}
+            {manualSource ? 'Domain Registration' : 'Inventory Source'}
             {check?.registration_check_skipped && (
               <span className="text-xs text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded ml-1">skipped</span>
             )}
           </h3>
-          {check?.registration_check_skipped ? (
+          {!manualSource ? (
+            <div className="space-y-0">
+              <InfoRow label="Source type" value={sourceTypeLabel(domain.source_type)} />
+              <InfoRow label="Source reference" value={sourceSummary || 'configured'} mono />
+              <InfoRow label="Registration lookup" value="Not applicable" />
+              <InfoRow label="Reason" value={check?.registration_skip_reason || `source_type=${domain.source_type}`} />
+              <InfoRow label="Inventory name" value={domain.name} />
+            </div>
+          ) : check?.registration_check_skipped ? (
             <div className="space-y-0">
               <InfoRow label="Check mode" value="SSL Only" />
               <InfoRow label="Reason" value={check.registration_skip_reason || 'check_mode=ssl_only'} />
@@ -555,7 +668,7 @@ export default function DomainDetail({ me }: DomainDetailProps) {
             <Clock size={15} className="text-gray-400" /> Expiry History
           </h3>
           <Suspense fallback={<Skeleton className="h-56 w-full" />}>
-            <ExpiryHistoryChart data={chartData} showDomain={!isSSLOnly} />
+            <ExpiryHistoryChart data={chartData} showDomain={showDomainExpirySeries} />
           </Suspense>
         </div>
       )}
@@ -572,7 +685,9 @@ export default function DomainDetail({ me }: DomainDetailProps) {
           <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
             <Server size={15} className="text-blue-400" /> HTTP/HTTPS
           </h3>
-          {check ? (
+          {!manualSource ? (
+            <p className="text-sm text-gray-500">Source-backed inventory items skip live HTTP probing and read certificate metadata directly from the configured source.</p>
+          ) : check ? (
             <>
               <InfoRow label="HTTP status" value={check.http_status_code || undefined} />
               <InfoRow label="Response time" value={check.http_response_time_ms ? `${check.http_response_time_ms}ms` : undefined} />
@@ -591,7 +706,9 @@ export default function DomainDetail({ me }: DomainDetailProps) {
           <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
             <Shield size={15} className="text-emerald-400" /> Advanced Security
           </h3>
-          {check ? (
+          {!manualSource ? (
+            <p className="text-sm text-gray-500">Revocation, CAA, cipher, and HTTP validation are not run for source-backed inventory items in v1.4.0.</p>
+          ) : check ? (
             <>
               <InfoRow label="Cipher grade" value={check.cipher_grade || undefined} />
               <InfoRow label="Cipher weak" value={check.cipher_weak ? 'Yes' : 'No'} />

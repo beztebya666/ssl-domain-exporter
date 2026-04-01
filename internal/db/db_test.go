@@ -142,7 +142,7 @@ func TestCreateUpdateAndScheduleDomainWithEnterpriseFields(t *testing.T) {
 
 	const rootPEM = "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
 
-	domain, err := database.CreateDomain("vcenter.internal", []string{"infra"}, map[string]string{"owner": "platform"}, rootPEM, "ssl_only", "10.0.0.1:53, 10.0.0.2:53", 3600, 8443, nil)
+	domain, err := database.CreateDomain("vcenter.internal", []string{"infra"}, map[string]string{"owner": "platform"}, DomainSourceManual, nil, rootPEM, "ssl_only", "10.0.0.1:53, 10.0.0.2:53", 3600, 8443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestCreateUpdateAndScheduleDomainWithEnterpriseFields(t *testing.T) {
 	}
 
 	const updatedPEM = "-----BEGIN CERTIFICATE-----\nUPDATED\n-----END CERTIFICATE-----"
-	if err := database.UpdateDomain(domain.ID, "vcsa.internal", []string{"platform", "prod"}, map[string]string{"owner": "ops", "zone": "corp"}, updatedPEM, "full", "10.0.0.3:53", true, 7200, 443, nil); err != nil {
+	if err := database.UpdateDomain(domain.ID, "vcsa.internal", []string{"platform", "prod"}, map[string]string{"owner": "ops", "zone": "corp"}, DomainSourceManual, nil, updatedPEM, "full", "10.0.0.3:53", true, 7200, 443, nil); err != nil {
 		t.Fatalf("update domain: %v", err)
 	}
 
@@ -218,7 +218,7 @@ func TestSaveCheckAndGetAllLastChecksKeepAuditFields(t *testing.T) {
 	database := newTestDB(t)
 	defer database.Close()
 
-	domain, err := database.CreateDomain("api.internal", nil, nil, "", "ssl_only", "10.0.0.1:53", 3600, 443, nil)
+	domain, err := database.CreateDomain("api.internal", nil, nil, DomainSourceManual, nil, "", "ssl_only", "10.0.0.1:53", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestGetLastCheckAndAllLastChecksPreferNewestIDOnTimestampTie(t *testing.T) 
 	database := newTestDB(t)
 	defer database.Close()
 
-	domain, err := database.CreateDomain("tie.example.com", nil, nil, "", "full", "", 3600, 443, nil)
+	domain, err := database.CreateDomain("tie.example.com", nil, nil, DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestGetNextScheduledCheckAt(t *testing.T) {
 	defer database.Close()
 
 	now := time.Now().UTC()
-	domain, err := database.CreateDomain("example.com", nil, nil, "", "full", "", 3600, 443, nil)
+	domain, err := database.CreateDomain("example.com", nil, nil, DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestGetNextScheduledCheckAtParsesLegacyTimestampWithMonotonicSuffix(t *test
 	defer database.Close()
 
 	now := time.Date(2026, time.March, 27, 10, 0, 0, 0, time.UTC)
-	domain, err := database.CreateDomain("legacy.example.com", nil, nil, "", "full", "", 3600, 443, nil)
+	domain, err := database.CreateDomain("legacy.example.com", nil, nil, DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestListDomainsPageAndListTagsUseTagsJSON(t *testing.T) {
 	database := newTestDB(t)
 	defer database.Close()
 
-	domain, err := database.CreateDomain("json-tags.example.com", []string{"Prod", "owner-email"}, nil, "", "full", "", 3600, 443, nil)
+	domain, err := database.CreateDomain("json-tags.example.com", []string{"Prod", "owner-email"}, nil, DomainSourceManual, nil, "", "full", "", 3600, 443, nil)
 	if err != nil {
 		t.Fatalf("create domain: %v", err)
 	}

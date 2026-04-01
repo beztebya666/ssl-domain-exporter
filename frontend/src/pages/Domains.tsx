@@ -45,6 +45,7 @@ import { formatDistanceToNow } from 'date-fns'
 import type { AuthMe, BootstrapConfig, Domain, Folder } from '../types'
 import { metadataSearchText, tagsToText } from '../lib/domainFields'
 import { filterableCustomFields, visibleMetadataSummary } from '../lib/customFields'
+import { formatSourceSummary, isManualSource, sourceTypeBadge } from '../lib/domainSources'
 import { useDebouncedValue } from '../lib/useDebouncedValue'
 import { activateCardOnKey, getErrorMessage, isTypingTarget, parseOptionalInt, updateFilter } from '../lib/utils'
 
@@ -290,6 +291,10 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
   const renderDomainCard = (d: Domain, idx: number) => {
     const tableMetadata = visibleMetadataSummary(d.metadata, visibleTableFields, 'table')
     const openDomain = () => navigate(`/domains/${d.id}`)
+    const manualSource = isManualSource(d.source_type)
+    const sourceSummary = formatSourceSummary(d.source_type, d.source_ref)
+    const displayName = `${d.name}${manualSource && d.port && d.port !== 443 ? `:${d.port}` : ''}`
+    const registrationSkipped = Boolean(d.last_check?.registration_check_skipped) || !manualSource
 
     return (
       <div
@@ -304,8 +309,13 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
         <div className="flex items-center gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium text-gray-100">{d.name}{d.port && d.port !== 443 ? `:${d.port}` : ''}</span>
+              <span className="font-medium text-gray-100">{displayName}</span>
               <StatusBadge status={d.last_check?.overall_status ?? 'unknown'} title={d.last_check?.primary_reason_text} />
+              {!manualSource && (
+                <span className="rounded-full border border-cyan-500/20 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-300">
+                  {sourceTypeBadge(d.source_type)}
+                </span>
+              )}
               {hasAdvisoryNotes(d) && (
                 <span className="rounded-full border border-slate-600/40 bg-slate-500/10 px-2 py-0.5 text-xs text-slate-300" title={d.last_check?.primary_reason_text}>
                   notes
@@ -321,13 +331,13 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
                   ))}
                 </div>
               )}
-              {d.check_mode === 'ssl_only' && (
+              {manualSource && d.check_mode === 'ssl_only' && (
                 <span className="rounded-full bg-violet-500/10 px-2 py-0.5 text-xs text-violet-400">SSL Only</span>
               )}
-              {d.custom_ca_pem?.trim() && (
+              {manualSource && d.custom_ca_pem?.trim() && (
                 <span className="rounded-full bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-400">custom CA</span>
               )}
-              {d.dns_servers?.trim() && (
+              {manualSource && d.dns_servers?.trim() && (
                 <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-400">custom DNS</span>
               )}
               {!d.enabled && (
@@ -337,6 +347,7 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
 
             {d.last_check && (
               <div className="mt-0.5 text-xs text-gray-500">
+                {sourceSummary && `${sourceSummary} | `}
                 Last checked {formatDistanceToNow(new Date(d.last_check.checked_at), { addSuffix: true })}
                 {d.last_check.ssl_version && ` | ${d.last_check.ssl_version}`}
                 {d.last_check.ssl_issuer && ` | ${d.last_check.ssl_issuer}`}
@@ -347,14 +358,14 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
             )}
             {!d.last_check && (
               <div className="mt-0.5 text-xs text-gray-500">
-                {tagsToText(d.tags) || tableMetadata.map(item => `${item.label}=${item.value}`).join(' | ') || metadataSearchText(d.metadata) || 'No checks yet'}
+                {sourceSummary || tagsToText(d.tags) || tableMetadata.map(item => `${item.label}=${item.value}`).join(' | ') || metadataSearchText(d.metadata) || 'No checks yet'}
               </div>
             )}
           </div>
 
           <div className="hidden w-48 space-y-1 xl:block">
             <ExpiryBar days={d.last_check?.ssl_expiry_days} label="SSL" warningDays={sslWarning} criticalDays={sslCritical} />
-            {d.check_mode === 'ssl_only' ? (
+            {registrationSkipped ? (
               <div className="text-xs text-gray-600">Domain: N/A</div>
             ) : (
               <ExpiryBar days={d.last_check?.domain_expiry_days} label="Domain" warningDays={domainWarning} criticalDays={domainCritical} />
@@ -397,17 +408,19 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
               </button>
             )}
 
-            <a
-              href={`https://${d.name}${d.port && d.port !== 443 ? `:${d.port}` : ''}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="btn-ghost p-1.5"
-              onClick={e => e.stopPropagation()}
-              title="Open site"
-              aria-label="Open site"
-            >
-              <ExternalLink size={14} />
-            </a>
+            {manualSource && (
+              <a
+                href={`https://${d.name}${d.port && d.port !== 443 ? `:${d.port}` : ''}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-ghost p-1.5"
+                onClick={e => e.stopPropagation()}
+                title="Open site"
+                aria-label="Open site"
+              >
+                <ExternalLink size={14} />
+              </a>
+            )}
 
             {canEdit && (
               <button
@@ -629,7 +642,7 @@ export default function Domains({ me, bootstrap }: DomainsProps) {
                         <input
                           id={`filter-${field.key}`}
                           className="input"
-                          type={field.type === 'date' ? 'date' : field.type === 'email' ? 'email' : field.type === 'url' ? 'url' : 'text'}
+                          type={field.type === 'date' ? 'date' : field.type === 'email' ? 'email' : field.type === 'url' ? 'url' : field.type === 'number' ? 'number' : 'text'}
                           value={metadataFilters[field.key] ?? ''}
                           onChange={e => setMetadataFilters(current => updateFilter(current, field.key, e.target.value))}
                           placeholder={field.placeholder || field.label}

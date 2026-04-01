@@ -11,10 +11,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type TLSConfig struct {
+	Enabled  bool   `yaml:"enabled" json:"enabled"`
+	CertFile string `yaml:"cert_file" json:"cert_file"`
+	KeyFile  string `yaml:"key_file" json:"key_file"`
+}
+
 type ServerConfig struct {
-	Host           string   `yaml:"host" json:"host"`
-	Port           string   `yaml:"port" json:"port"`
-	AllowedOrigins []string `yaml:"allowed_origins" json:"allowed_origins"`
+	Host           string    `yaml:"host" json:"host"`
+	Port           string    `yaml:"port" json:"port"`
+	AllowedOrigins []string  `yaml:"allowed_origins" json:"allowed_origins"`
+	TLS            TLSConfig `yaml:"tls" json:"tls"`
 }
 
 type DatabaseConfig struct {
@@ -144,8 +151,17 @@ type PrometheusConfig struct {
 	Labels  PrometheusLabelsConfig `yaml:"labels" json:"labels"`
 }
 
+type SyslogConfig struct {
+	Enabled  bool   `yaml:"enabled" json:"enabled"`
+	Network  string `yaml:"network" json:"network"`   // "tcp" or "udp"
+	Address  string `yaml:"address" json:"address"`   // host:port, e.g. "syslog.example.com:514"
+	Tag      string `yaml:"tag" json:"tag"`           // syslog tag, default "ssl-domain-exporter"
+	Facility string `yaml:"facility" json:"facility"` // syslog facility, default "local0"
+}
+
 type LoggingConfig struct {
-	JSON bool `yaml:"json" json:"json"`
+	JSON   bool         `yaml:"json" json:"json"`
+	Syslog SyslogConfig `yaml:"syslog" json:"syslog"`
 }
 
 type MaintenanceConfig struct {
@@ -153,6 +169,26 @@ type MaintenanceConfig struct {
 	CheckRetentionDays     int    `yaml:"check_retention_days" json:"check_retention_days"`
 	AuditRetentionDays     int    `yaml:"audit_retention_days" json:"audit_retention_days"`
 	RetentionSweepInterval string `yaml:"retention_sweep_interval" json:"retention_sweep_interval"`
+}
+
+type K8SConfig struct {
+	Enabled            bool   `yaml:"enabled" json:"enabled"`
+	APIServer          string `yaml:"api_server" json:"api_server"`
+	Token              string `yaml:"token" json:"token"`
+	TokenFile          string `yaml:"token_file" json:"token_file"`
+	Namespace          string `yaml:"namespace" json:"namespace"`
+	LabelSelector      string `yaml:"label_selector" json:"label_selector"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify" json:"insecure_skip_verify"`
+	CACertFile         string `yaml:"ca_cert_file" json:"ca_cert_file"`
+}
+
+type F5Config struct {
+	Enabled            bool   `yaml:"enabled" json:"enabled"`
+	Host               string `yaml:"host" json:"host"`
+	Username           string `yaml:"username" json:"username"`
+	Password           string `yaml:"password" json:"password"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify" json:"insecure_skip_verify"`
+	Partition          string `yaml:"partition" json:"partition"`
 }
 
 type Config struct {
@@ -170,6 +206,8 @@ type Config struct {
 	Prometheus    PrometheusConfig    `yaml:"prometheus" json:"prometheus"`
 	Maintenance   MaintenanceConfig   `yaml:"maintenance" json:"maintenance"`
 	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
+	Kubernetes    K8SConfig           `yaml:"kubernetes" json:"kubernetes"`
+	F5            F5Config            `yaml:"f5" json:"f5"`
 	Warnings      []string            `yaml:"-" json:"warnings,omitempty"`
 
 	mu       sync.RWMutex `yaml:"-" json:"-"`
@@ -413,6 +451,21 @@ func (c *Config) normalize() {
 	if c.Maintenance.RetentionSweepInterval == "" {
 		c.Maintenance.RetentionSweepInterval = "24h"
 	}
+
+	// Syslog defaults
+	network := strings.ToLower(strings.TrimSpace(c.Logging.Syslog.Network))
+	if network != "tcp" && network != "udp" {
+		network = "udp"
+	}
+	c.Logging.Syslog.Network = network
+	if c.Logging.Syslog.Tag == "" {
+		c.Logging.Syslog.Tag = "ssl-domain-exporter"
+	}
+	facility := strings.ToLower(strings.TrimSpace(c.Logging.Syslog.Facility))
+	if facility == "" {
+		facility = "local0"
+	}
+	c.Logging.Syslog.Facility = facility
 }
 
 func (c *Config) Save() error {
@@ -473,6 +526,8 @@ func (c *Config) cloneInternal() *Config {
 		Prometheus:    c.Prometheus,
 		Maintenance:   c.Maintenance,
 		Logging:       c.Logging,
+		Kubernetes:    c.Kubernetes,
+		F5:            c.F5,
 		filePath:      c.filePath,
 	}
 	// Deep copy slices
@@ -517,6 +572,8 @@ func (c *Config) ApplyFrom(in *Config) {
 	c.Prometheus = next.Prometheus
 	c.Maintenance = next.Maintenance
 	c.Logging = next.Logging
+	c.Kubernetes = next.Kubernetes
+	c.F5 = next.F5
 	c.Warnings = nil
 	c.normalize()
 	c.filePath = filePath
@@ -532,6 +589,15 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("SERVER_ALLOWED_ORIGINS"); v != "" {
 		cfg.Server.AllowedOrigins = normalizeCommaList(v)
+	}
+	if v := os.Getenv("SERVER_TLS_ENABLED"); v != "" {
+		cfg.Server.TLS.Enabled = ParseBool(v)
+	}
+	if v := os.Getenv("SERVER_TLS_CERT_FILE"); v != "" {
+		cfg.Server.TLS.CertFile = v
+	}
+	if v := os.Getenv("SERVER_TLS_KEY_FILE"); v != "" {
+		cfg.Server.TLS.KeyFile = v
 	}
 	if v := os.Getenv("DATABASE_PATH"); v != "" {
 		cfg.Database.Path = v
@@ -615,6 +681,73 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("FEATURE_STRUCTURED_LOGS"); v != "" {
 		cfg.Features.StructuredLogs = ParseBool(v)
+	}
+
+	// Syslog env overrides
+	if v := os.Getenv("SYSLOG_ENABLED"); v != "" {
+		cfg.Logging.Syslog.Enabled = ParseBool(v)
+	}
+	if v := os.Getenv("SYSLOG_NETWORK"); v != "" {
+		cfg.Logging.Syslog.Network = v
+	}
+	if v := os.Getenv("SYSLOG_ADDRESS"); v != "" {
+		cfg.Logging.Syslog.Address = v
+	}
+	if v := os.Getenv("SYSLOG_TAG"); v != "" {
+		cfg.Logging.Syslog.Tag = v
+	}
+	if v := os.Getenv("SYSLOG_FACILITY"); v != "" {
+		cfg.Logging.Syslog.Facility = v
+	}
+
+	// K8S env overrides
+	if v := os.Getenv("K8S_ENABLED"); v != "" {
+		cfg.Kubernetes.Enabled = ParseBool(v)
+	}
+	if v := os.Getenv("K8S_API_SERVER"); v != "" {
+		cfg.Kubernetes.APIServer = v
+	}
+	if v := os.Getenv("K8S_TOKEN"); v != "" {
+		cfg.Kubernetes.Token = v
+	} else if v, ok := lookupEnvFile("K8S_TOKEN_FILE"); ok {
+		cfg.Kubernetes.Token = v
+	}
+	if v := os.Getenv("K8S_TOKEN_FILE"); v != "" {
+		cfg.Kubernetes.TokenFile = v
+	}
+	if v := os.Getenv("K8S_NAMESPACE"); v != "" {
+		cfg.Kubernetes.Namespace = v
+	}
+	if v := os.Getenv("K8S_LABEL_SELECTOR"); v != "" {
+		cfg.Kubernetes.LabelSelector = v
+	}
+	if v := os.Getenv("K8S_CA_CERT_FILE"); v != "" {
+		cfg.Kubernetes.CACertFile = v
+	}
+	if v := os.Getenv("K8S_INSECURE_SKIP_VERIFY"); v != "" {
+		cfg.Kubernetes.InsecureSkipVerify = ParseBool(v)
+	}
+
+	// F5 env overrides
+	if v := os.Getenv("F5_ENABLED"); v != "" {
+		cfg.F5.Enabled = ParseBool(v)
+	}
+	if v := os.Getenv("F5_HOST"); v != "" {
+		cfg.F5.Host = v
+	}
+	if v := os.Getenv("F5_USERNAME"); v != "" {
+		cfg.F5.Username = v
+	}
+	if v := os.Getenv("F5_PASSWORD"); v != "" {
+		cfg.F5.Password = v
+	} else if v, ok := lookupEnvFile("F5_PASSWORD_FILE"); ok {
+		cfg.F5.Password = v
+	}
+	if v := os.Getenv("F5_PARTITION"); v != "" {
+		cfg.F5.Partition = v
+	}
+	if v := os.Getenv("F5_INSECURE_SKIP_VERIFY"); v != "" {
+		cfg.F5.InsecureSkipVerify = ParseBool(v)
 	}
 
 	if v := os.Getenv("WEBHOOK_ENABLED"); v != "" {

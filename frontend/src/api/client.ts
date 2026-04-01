@@ -1,5 +1,7 @@
 import axios from 'axios'
 import type {
+  AdHocNotificationRequest,
+  AdHocNotificationResponse,
   AuditLog,
   AppConfig,
   BackupFile,
@@ -15,12 +17,15 @@ import type {
   DomainImportRequest,
   DomainImportResponse,
   DomainWritePayload,
+  F5ScanResult,
   Folder,
   HealthStatus,
+  K8SScanResult,
   NotificationDeliveryStatus,
   NotificationTestRequest,
   NotificationTestResult,
   Summary,
+  SyslogTestResult,
   TimelineResponse,
   UserAccount,
   UserWritePayload,
@@ -118,19 +123,22 @@ export const logoutSession = async (): Promise<void> => {
 }
 
 export const fetchDomains = (): Promise<Domain[]> =>
-  api.get('/domains').then(r => r.data)
+  api.get('/domains').then(r => normalizeDomains(r.data))
 
 export const fetchDomainsPage = (params: DomainListParams): Promise<DomainListResponse> =>
-  api.get('/domains/search', { params: buildDomainListParams(params) }).then(r => r.data)
+  api.get('/domains/search', { params: buildDomainListParams(params) }).then(r => ({
+    ...r.data,
+    items: normalizeDomains(r.data.items ?? []),
+  }))
 
 export const fetchDomain = (id: number): Promise<Domain> =>
-  api.get(`/domains/${id}`).then(r => r.data)
+  api.get(`/domains/${id}`).then(r => normalizeDomain(r.data))
 
 export const createDomain = (data: DomainWritePayload): Promise<Domain> =>
-  api.post('/domains', data).then(r => r.data)
+  api.post('/domains', data).then(r => normalizeDomain(r.data))
 
 export const updateDomain = (id: number, data: DomainWritePayload): Promise<Domain> =>
-  api.put(`/domains/${id}`, data).then(r => r.data)
+  api.put(`/domains/${id}`, data).then(r => normalizeDomain(r.data))
 
 export const importDomains = (data: DomainImportRequest): Promise<DomainImportResponse> =>
   api.post('/domains/import', data).then(r => r.data)
@@ -200,6 +208,18 @@ export const fetchNotificationStatus = (): Promise<NotificationDeliveryStatus[]>
 export const testNotifications = (data?: NotificationTestRequest): Promise<NotificationTestResult[]> =>
   api.post('/notifications/test', data ?? {}).then(r => r.data)
 
+export const testSyslog = (data: AppConfig['logging']['syslog']): Promise<SyslogTestResult> =>
+  api.post('/syslog/test', data).then(r => r.data)
+
+export const fetchK8SCertificates = (): Promise<K8SScanResult> =>
+  api.get('/k8s/certificates').then(r => r.data)
+
+export const fetchF5Certificates = (): Promise<F5ScanResult> =>
+  api.get('/f5/certificates').then(r => r.data)
+
+export const sendAdHocNotification = (id: number, data: AdHocNotificationRequest): Promise<AdHocNotificationResponse> =>
+  api.post(`/domains/${id}/notify`, data).then(r => r.data)
+
 export const fetchUsers = (): Promise<UserAccount[]> =>
   api.get('/users').then(r => r.data)
 
@@ -257,4 +277,18 @@ function buildDomainListParams(params?: DomainListParams): Record<string, string
     encoded[key] = value as string | number
   })
   return encoded
+}
+
+function normalizeDomains(items: Domain[]): Domain[] {
+  return (items ?? []).map(normalizeDomain)
+}
+
+function normalizeDomain(domain: Domain): Domain {
+  return {
+    ...domain,
+    source_type: domain.source_type ?? 'manual',
+    source_ref: domain.source_ref ?? {},
+    tags: domain.tags ?? [],
+    metadata: domain.metadata ?? {},
+  }
 }
