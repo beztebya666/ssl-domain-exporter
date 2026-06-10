@@ -1,7 +1,8 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { LucideIcon } from 'lucide-react'
-import { BrowserRouter, NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { BrowserRouter, HashRouter, NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { isDemo } from './lib/demo'
 import {
   Activity,
   ChevronsLeft,
@@ -603,9 +604,11 @@ function AppShell() {
 }
 
 export default function App() {
+  // GitHub Pages serves under a subpath with no SPA fallback → hash routing in demo.
+  const Router = isDemo() ? HashRouter : BrowserRouter
   return (
-    <BrowserRouter>
+    <Router>
       <AppShell />
-    </BrowserRouter>
+    </Router>
   )
 }

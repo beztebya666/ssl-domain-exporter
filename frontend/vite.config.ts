@@ -7,6 +7,7 @@ const uiVersion = `v${pkg.version}`
 const uiBuildID = process.env.UI_BUILD_ID || new Date().toISOString()
 
 export default defineConfig({
+  base: process.env.VITE_BASE || '/',
   plugins: [react()],
   define: {
     __UI_VERSION__: JSON.stringify(uiVersion),
