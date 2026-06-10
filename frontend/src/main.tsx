@@ -1,3 +1,7 @@
+// IMPORTANT: import the demo bootstrap FIRST — it installs the axios mock adapter
+// at module-eval, which must run before App → api/client.ts calls axios.create().
+import { isDemo } from './lib/demo'
+import { DemoBanner } from './components/DemoBanner'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -22,6 +26,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       <QueryClientProvider client={queryClient}>
         <ToastProvider>
           <App />
+          {isDemo() && <DemoBanner />}
         </ToastProvider>
       </QueryClientProvider>
     </ErrorBoundary>
